@@ -46,6 +46,7 @@ SAP2_DEFAULTS: dict[str, Any] = {
     "batch_one_process_per_shot": True,
     "batch_gap_seconds": 5,
     "checkpoint_root": "",
+    "download_models_in_colab": True,
     # 0 = auto from VRAM (80GB → 4096 long edge); else cap inference long edge (px)
     "inference_long_edge": 0,
 }
@@ -71,12 +72,28 @@ def _date_folder() -> str:
 
 def _checkpoint_root(shared: dict[str, Any]) -> Path:
     explicit = str(shared.get("checkpoint_root", "")).strip()
-    if explicit:
+    if explicit and "VDA_models" not in explicit.replace("\\", "/"):
         return Path(explicit)
     env = os.environ.get("SAPIENS_CHECKPOINT_ROOT", "").strip()
     if env:
         return Path(env)
-    return _drive_mount() / "VDA_models" / "sapiens2_host"
+    from download_checkpoints_colab import COLAB_CHECKPOINT_ROOT
+
+    return Path(COLAB_CHECKPOINT_ROOT)
+
+
+def _ensure_models_if_needed(shared: dict[str, Any], ckpt_root: Path) -> None:
+    if not bool(shared.get("download_models_in_colab", True)):
+        return
+    from download_checkpoints_colab import ensure_checkpoints
+
+    _log.info("Ensuring SAP2 checkpoints on Colab disk → %s", ckpt_root)
+    ensure_checkpoints(
+        ckpt_root,
+        sapiens_model=str(shared.get("sapiens_model", "1b")),
+        run_matting=bool(shared.get("run_matting", True)),
+        run_normal=bool(shared.get("run_normal", True)),
+    )
 
 
 def _output_root(shared: dict[str, Any]) -> Path:
@@ -329,7 +346,8 @@ def _run_batch(job_path: Path, shot_index: int | None) -> int:
         return 1
 
     ckpt_root = _checkpoint_root(shared)
-    os.environ.setdefault("SAPIENS_CHECKPOINT_ROOT", str(ckpt_root))
+    _ensure_models_if_needed(shared, ckpt_root)
+    os.environ["SAPIENS_CHECKPOINT_ROOT"] = str(ckpt_root)
     _log.info("SAP2 root=%s dense=%s checkpoints=%s", _SAP2_ROOT, _DENSE, ckpt_root)
 
     if shot_index is not None:

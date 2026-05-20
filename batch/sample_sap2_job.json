@@ -14,7 +14,8 @@
     "qc_mp4": false,
     "batch_one_process_per_shot": true,
     "batch_gap_seconds": 5,
-    "checkpoint_root": "/content/drive/MyDrive/VDA_models/sapiens2_host"
+    "checkpoint_root": "/content/sapiens2_checkpoints",
+    "download_models_in_colab": true
   },
   "sequences": [
     {

@@ -10,26 +10,17 @@ Human **matting** + **surface normals** using [Sapiens2](https://github.com/apan
    - `MyDrive/VDA_Jobs/` — job JSON + cellcode from Desk (or manual)
 3. **Plates:** EXR sequence per shot (`plate_dir` + `plate_pattern` in JSON)
 
-## One-time: download models to Drive
+## Models (automatic in Cell 3)
 
-In a Colab cell (after mounting Drive):
-
-```python
-!git clone --depth 1 https://github.com/apanner/sap2.git /content/sap2
-%cd /content/sap2
-!pip install -q huggingface_hub
-!python scripts/download_checkpoints_colab.py --root /content/drive/MyDrive/VDA_models/sapiens2_host
-```
-
-Expected files:
+**No Drive download needed.** Cell 3 downloads weights to Colab local disk:
 
 ```
-VDA_models/sapiens2_host/
+/content/sapiens2_checkpoints/
 ├── matting/sapiens2_1b_matting.safetensors
 └── normal/sapiens2_1b_normal.safetensors
 ```
 
-HF sources: [matting-1b](https://huggingface.co/facebook/sapiens2-matting-1b), [normal-1b](https://huggingface.co/facebook/sapiens2-normal-1b).
+Re-run Cell 3 in a **new runtime** to re-download (~12 GB). Outputs still go to **Drive** under `SAP2_output/`.
 
 ## Batch JSON
 

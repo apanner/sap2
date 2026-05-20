@@ -1,6 +1,9 @@
 """
 SAP2 Colab cellcode — Sapiens2 human matting + normals.
-Drive: VDA_Jobs/code/{job_id}_cellcode.py
+Uploaded to Drive: VDA_Jobs/code/{job_id}_cellcode.py
+Launched from: google_desk_app/run_app_sap2.bat → Send to Colab
+
+Models download to Colab disk (/content/sapiens2_checkpoints) during Cell 3 — not Drive.
 """
 
 from __future__ import annotations
@@ -12,6 +15,9 @@ import subprocess
 import sys
 import traceback
 from datetime import datetime
+
+# Colab session cache (re-downloaded when runtime restarts)
+COLAB_CHECKPOINT_ROOT = "/content/sapiens2_checkpoints"
 
 
 def setup_sap2_cell1(drive_service):
@@ -41,19 +47,31 @@ def load_sap2_config_cell2(drive_service, config_file_id):
             print("   Config download: " + str(int(status.progress() * 100)) + "%")
     with open(config_path, encoding="utf-8") as f:
         config = json.load(f)
+    is_batch = bool(config.get("sequences"))
     date_folder = datetime.now().strftime("%Y%m%d")
     os.environ["SAP2_DRIVE_MOUNT"] = "/content/drive/MyDrive"
     os.environ["SAP2_RUNTIME_DATE_FOLDER"] = date_folder
-    print("[OK] SAP2 config loaded — date folder:", date_folder)
+    os.environ["SAPIENS_CHECKPOINT_ROOT"] = COLAB_CHECKPOINT_ROOT
+    logger = logging.getLogger("sap2_colab")
+    if not logger.handlers:
+        h = logging.StreamHandler()
+        logger.addHandler(h)
+        logger.setLevel(logging.INFO)
+    print("[OK] SAP2 config loaded — batch=" + str(is_batch) + " date=" + date_folder)
+    print("   Models will download to:", COLAB_CHECKPOINT_ROOT)
     print("   Shots:", len(config.get("sequences") or []))
-    return config_path, config
+    return config, "/content/drive/MyDrive", date_folder, logger, is_batch, config_path
 
 
 def _stream_subprocess(cmd, cwd=None, env=None):
+    run_env = dict(env or os.environ)
+    run_env["PYTHONUNBUFFERED"] = "1"
+    if cmd and cmd[0] == sys.executable:
+        cmd = [sys.executable, "-u", *cmd[1:]]
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
-        env=env,
+        env=run_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -65,53 +83,88 @@ def _stream_subprocess(cmd, cwd=None, env=None):
     return proc.wait()
 
 
-def run_sap2_cell3(config_path: str, repo_url: str = "https://github.com/apanner/sap2.git"):
-    print("=" * 60)
-    print("SAP2 — clone, install, run batch")
-    print("=" * 60)
+def _run_sap2_batch(config_path: str, repo_url: str, date_folder: str) -> bool:
     clone_dir = "/content/sap2"
     if not os.path.isdir(clone_dir):
         subprocess.check_call(["git", "clone", "--depth", "1", repo_url, clone_dir])
     else:
-        print("[OK] sap2 already at", clone_dir)
+        print("[OK] sap2 repo at", clone_dir)
 
     subprocess.check_call([sys.executable, "scripts/colab_setup.py"], cwd=clone_dir)
 
+    with open(config_path, encoding="utf-8") as f:
+        job = json.load(f)
+    shared = job.get("shared") or job.get("shared_settings") or {}
+    shared["checkpoint_root"] = COLAB_CHECKPOINT_ROOT
+    shared["download_models_in_colab"] = True
+
     env = os.environ.copy()
-    env.setdefault("SAP2_DRIVE_MOUNT", "/content/drive/MyDrive")
-    env.setdefault(
-        "SAPIENS_CHECKPOINT_ROOT",
-        env["SAP2_DRIVE_MOUNT"] + "/VDA_models/sapiens2_host",
-    )
+    env["SAP2_DRIVE_MOUNT"] = "/content/drive/MyDrive"
+    env["SAP2_RUNTIME_DATE_FOLDER"] = date_folder
+    env["SAPIENS_CHECKPOINT_ROOT"] = COLAB_CHECKPOINT_ROOT
 
     cmd = [
         sys.executable,
-        "-u",
         "scripts/sap2_colab_run.py",
         "--job-json",
         config_path,
     ]
-    print("[sap2_colab_run] starting:", " ".join(cmd), flush=True)
+    print("\n[sap2_colab_run] starting:", " ".join(cmd), flush=True)
+    print("[info] Checkpoints: download to", COLAB_CHECKPOINT_ROOT, "then infer", flush=True)
     rc = _stream_subprocess(cmd, cwd=clone_dir, env=env)
     if rc != 0:
-        print("[STOP] SAP2 batch failed (exit %d). Scroll up for [ERROR] lines." % rc)
-        raise SystemExit(rc)
-    print("[OK] SAP2 batch complete")
+        print(
+            "\n[STOP] sap2_colab_run.py exited %s. Scroll up for [download] / [ERROR]. "
+            "HF login: huggingface_hub.login() if 401." % rc,
+            flush=True,
+        )
+    return rc == 0
 
 
-def main_cell3_from_drive(config_file_id: str, drive_service=None):
-    if drive_service is None:
-        from googleapiclient.discovery import build
-        from google.colab import auth
+def process_sap2_cell3(
+    config,
+    drive_base_path,
+    date_folder,
+    logger,
+    is_batch,
+    config_path,
+):
+    if not is_batch:
+        print("[ERROR] Batch JSON must contain sequences[]")
+        return False
 
-        auth.authenticate_user()
-        drive_service = build("drive", "v3")
-    config_path, cfg = load_sap2_config_cell2(drive_service, config_file_id)
-    shared = cfg.get("shared") or cfg.get("shared_settings") or {}
-    repo_url = str(shared.get("sap2_git_url", "https://github.com/apanner/sap2.git"))
+    shared = config.get("shared") or config.get("shared_settings") or {}
+    git_url = str(
+        os.environ.get("SAP2_GIT_URL")
+        or shared.get("sap2_git_url")
+        or "https://github.com/apanner/sap2.git"
+    )
+    print("\n" + "=" * 60)
+    print("SAP2 batch — install → download models → matte + normals")
+    print("=" * 60)
+
     try:
-        run_sap2_cell3(config_path, repo_url=repo_url)
-    except Exception:
-        traceback.print_exc()
-        print("[STOP] Exception in SAP2 cell — see traceback above.")
-        raise
+        ok = _run_sap2_batch(config_path, git_url, date_folder)
+    except Exception as exc:
+        print("[ERROR] " + str(exc))
+        print(traceback.format_exc())
+        ok = False
+
+    out_path = shared.get("output_folder_path", "VDA_output")
+    root = shared.get("sap2_output_root", "SAP2_output")
+    print(
+        "\nOutputs on Drive: MyDrive/"
+        + str(out_path)
+        + "/"
+        + date_folder
+        + "/"
+        + root
+        + "/<shot>/matte/ normal/"
+    )
+    print("Models stayed on Colab disk only:", COLAB_CHECKPOINT_ROOT)
+    return ok
+
+
+def run_sap2_cell3(config_path: str, repo_url: str = "https://github.com/apanner/sap2.git"):
+    date_folder = os.environ.get("SAP2_RUNTIME_DATE_FOLDER", datetime.now().strftime("%Y%m%d"))
+    return _run_sap2_batch(config_path, repo_url, date_folder)
