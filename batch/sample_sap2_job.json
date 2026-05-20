@@ -1,0 +1,28 @@
+{
+  "model_type": "SAP2_STANDALONE",
+  "batch_id": "sap2_sample_001",
+  "shared": {
+    "sapiens_model": "1b",
+    "run_matting": true,
+    "run_normal": true,
+    "export_matte_exr": true,
+    "export_normal_exr": true,
+    "use_plate_jpeg_cache": true,
+    "plate_jpeg_quality": 92,
+    "plate_cache_workers": 8,
+    "inference_long_edge": 0,
+    "qc_mp4": false,
+    "batch_one_process_per_shot": true,
+    "batch_gap_seconds": 5,
+    "checkpoint_root": "/content/drive/MyDrive/VDA_models/sapiens2_host"
+  },
+  "sequences": [
+    {
+      "shot_name": "SHOT_001",
+      "plate_dir": "/content/drive/MyDrive/plates/SHOT_001",
+      "plate_pattern": "SHOT_001.%04d.exr",
+      "frame_start": 1001,
+      "frame_end": 1010
+    }
+  ]
+}
