@@ -44,7 +44,7 @@ def read_plate_rgb(path: Path) -> np.ndarray:
         rgb = arr[..., :3]
     else:
         rgb = np.stack([arr[..., 0]] * 3, axis=-1)
-    return np.clip(rgb.astype(np.float32), 0.0, None)
+    return np.ascontiguousarray(np.clip(rgb.astype(np.float32), 0.0, None))
 
 
 def write_exr_float(path: Path, data: np.ndarray, *, channels: int | None = None) -> None:
@@ -53,6 +53,8 @@ def write_exr_float(path: Path, data: np.ndarray, *, channels: int | None = None
     arr = np.asarray(data, dtype=np.float32)
     if arr.ndim == 2:
         arr = arr[..., np.newaxis]
+    # OIIO set_pixels requires C-contiguous H×W×C (transpose from torch is often non-contiguous)
+    arr = np.ascontiguousarray(arr)
     h, w, c = arr.shape
     if channels is not None:
         c = channels
