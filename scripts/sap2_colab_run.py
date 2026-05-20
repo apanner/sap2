@@ -313,13 +313,18 @@ def _run_shot(
         normal_dir.mkdir(parents=True, exist_ok=True)
         proc = Sap2ShotProcessor(_DENSE, ckpt_root, model_key=model_key, device=device, inference_long_edge=long_edge)
         try:
+            done = 0
             for fi in range(frame_start, frame_end + 1):
                 exr_out = normal_dir / f"normal_{fi:06d}.exr"
                 if exr_out.is_file() and export_normal:
+                    done += 1
                     continue
                 normal = proc.process_frame_normal(cache_path(cache_dir, fi))
                 if export_normal:
                     write_normal_exr(exr_out, normal)
+                done += 1
+                if done == 1 or done % 10 == 0 or done == n_frames:
+                    _log.info("Normal EXR %d/%d", done, n_frames)
         finally:
             proc.unload()
     elif run_normal:

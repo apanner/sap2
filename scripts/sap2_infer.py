@@ -124,7 +124,8 @@ def _run_normal_frame(model: Any, image_bgr: np.ndarray) -> np.ndarray:
         mode="bilinear",
         align_corners=False,
     )
-    return normal.squeeze(0).cpu().numpy().transpose(1, 2, 0)
+    out = normal.squeeze(0).cpu().numpy().transpose(1, 2, 0)
+    return np.ascontiguousarray(out.astype(np.float32, copy=True))
 
 
 class Sap2ShotProcessor:

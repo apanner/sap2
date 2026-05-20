@@ -89,6 +89,15 @@ def _run_sap2_batch(config_path: str, repo_url: str, date_folder: str) -> bool:
         subprocess.check_call(["git", "clone", "--depth", "1", repo_url, clone_dir])
     else:
         print("[OK] sap2 repo at", clone_dir)
+        pull = subprocess.run(
+            ["git", "-C", clone_dir, "pull", "--ff-only"],
+            capture_output=True,
+            text=True,
+        )
+        if pull.returncode == 0:
+            print("[OK] git pull:", (pull.stdout or "").strip() or "up to date")
+        else:
+            print("[warn] git pull failed — using existing clone:", pull.stderr or pull.stdout)
 
     subprocess.check_call([sys.executable, "scripts/colab_setup.py"], cwd=clone_dir)
 

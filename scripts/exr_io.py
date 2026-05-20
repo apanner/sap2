@@ -44,36 +44,79 @@ def read_plate_rgb(path: Path) -> np.ndarray:
         rgb = arr[..., :3]
     else:
         rgb = np.stack([arr[..., 0]] * 3, axis=-1)
-    return np.ascontiguousarray(np.clip(rgb.astype(np.float32), 0.0, None))
+    return np.array(rgb, dtype=np.float32, copy=True, order="C")
+
+
+def _to_float32_c(arr: np.ndarray) -> np.ndarray:
+    """Force a fresh C-contiguous float32 buffer (torch transpose is often non-contiguous)."""
+    return np.array(arr, dtype=np.float32, copy=True, order="C")
+
+
+def _planar_2d_channels(arr: np.ndarray) -> list[np.ndarray]:
+    """H×W×C interleaved → list of C separate H×W planes (OIIO-safe)."""
+    if arr.ndim == 2:
+        return [_to_float32_c(arr)]
+    out: list[np.ndarray] = []
+    for i in range(arr.shape[2]):
+        out.append(np.array(arr[:, :, i], dtype=np.float32, copy=True, order="C"))
+    return out
 
 
 def write_exr_float(path: Path, data: np.ndarray, *, channels: int | None = None) -> None:
     oiio = require_oiio()
     path.parent.mkdir(parents=True, exist_ok=True)
-    arr = np.asarray(data, dtype=np.float32)
+    arr = _to_float32_c(data)
     if arr.ndim == 2:
         arr = arr[..., np.newaxis]
-    # OIIO set_pixels requires C-contiguous H×W×C (transpose from torch is often non-contiguous)
-    arr = np.ascontiguousarray(arr)
-    h, w, c = arr.shape
-    if channels is not None:
-        c = channels
+    h, w, nc = arr.shape
+    c = int(channels) if channels is not None else int(nc)
+    if nc < c:
+        raise ValueError(f"Expected at least {c} channels, got shape {arr.shape}")
+    if nc > c:
+        arr = _to_float32_c(arr[:, :, :c])
+
     spec = oiio.ImageSpec(w, h, c, oiio.FLOAT)
+    if c == 1:
+        spec.channelnames = ("A",)
+    elif c == 3:
+        spec.channelnames = ("R", "G", "B")
+
     buf = oiio.ImageBuf(spec)
-    if not buf.set_pixels(oiio.ROI(0, w, 0, h, 0, 1, 0, c), arr):
-        raise RuntimeError(f"OIIO write failed: {path} — {buf.geterror()}")
+    roi = oiio.ROI(0, w, 0, h, 0, 1, 0, c)
+    err = ""
+
+    if c == 1:
+        plane = np.array(arr[:, :, 0], dtype=np.float32, copy=True, order="C")
+        if buf.set_pixels(roi, plane):
+            err = ""
+        else:
+            err = str(buf.geterror())
+    else:
+        planes = _planar_2d_channels(arr)
+        if buf.set_pixels(roi, planes):
+            err = ""
+        elif buf.set_pixels(roi, _to_float32_c(arr)):
+            err = ""
+        else:
+            err = str(buf.geterror())
+
+    if err:
+        raise RuntimeError(f"OIIO set_pixels failed: {path} — {err}")
     if not buf.write(str(path)):
         raise RuntimeError(f"OIIO write failed: {path} — {buf.geterror()}")
 
 
 def write_alpha_exr(path: Path, alpha: np.ndarray) -> None:
-    a = np.clip(np.asarray(alpha, dtype=np.float32), 0.0, 1.0)
-    write_exr_float(path, a[..., np.newaxis], channels=1)
+    a = np.clip(_to_float32_c(alpha), 0.0, 1.0)
+    write_exr_float(path, a, channels=1)
 
 
 def write_normal_exr(path: Path, normal: np.ndarray) -> None:
-    n = np.asarray(normal, dtype=np.float32)
+    n = _to_float32_c(normal)
     if n.shape[-1] != 3:
         raise ValueError(f"normal must be HxWx3, got {n.shape}")
-    n = n / np.maximum(np.linalg.norm(n, axis=-1, keepdims=True), 1e-8)
-    write_exr_float(path, np.clip(n, -1.0, 1.0), channels=3)
+    norm = np.linalg.norm(n, axis=-1, keepdims=True)
+    n = n / np.maximum(norm, 1e-8)
+    n = np.clip(n, -1.0, 1.0)
+    n = _to_float32_c(n)
+    write_exr_float(path, n, channels=3)
