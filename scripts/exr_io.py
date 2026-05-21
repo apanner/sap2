@@ -48,18 +48,8 @@ def read_plate_rgb(path: Path) -> np.ndarray:
 
 
 def _to_float32_c(arr: np.ndarray) -> np.ndarray:
-    """Force a fresh C-contiguous float32 buffer (torch transpose is often non-contiguous)."""
-    return np.array(arr, dtype=np.float32, copy=True, order="C")
-
-
-def _planar_2d_channels(arr: np.ndarray) -> list[np.ndarray]:
-    """H×W×C interleaved → list of C separate H×W planes (OIIO-safe)."""
-    if arr.ndim == 2:
-        return [_to_float32_c(arr)]
-    out: list[np.ndarray] = []
-    for i in range(arr.shape[2]):
-        out.append(np.array(arr[:, :, i], dtype=np.float32, copy=True, order="C"))
-    return out
+    """Force C-contiguous float32 (required by OIIO set_pixels Buffer API)."""
+    return np.ascontiguousarray(arr, dtype=np.float32)
 
 
 def write_exr_float(path: Path, data: np.ndarray, *, channels: int | None = None) -> None:
@@ -83,25 +73,15 @@ def write_exr_float(path: Path, data: np.ndarray, *, channels: int | None = None
 
     buf = oiio.ImageBuf(spec)
     roi = oiio.ROI(0, w, 0, h, 0, 1, 0, c)
-    err = ""
 
+    # oiio-python: single contiguous buffer only (not a list of planar channels)
     if c == 1:
-        plane = np.array(arr[:, :, 0], dtype=np.float32, copy=True, order="C")
-        if buf.set_pixels(roi, plane):
-            err = ""
-        else:
-            err = str(buf.geterror())
+        pixels = _to_float32_c(arr[:, :, 0])
     else:
-        planes = _planar_2d_channels(arr)
-        if buf.set_pixels(roi, planes):
-            err = ""
-        elif buf.set_pixels(roi, _to_float32_c(arr)):
-            err = ""
-        else:
-            err = str(buf.geterror())
+        pixels = _to_float32_c(arr)
 
-    if err:
-        raise RuntimeError(f"OIIO set_pixels failed: {path} — {err}")
+    if not buf.set_pixels(roi, pixels):
+        raise RuntimeError(f"OIIO set_pixels failed: {path} — {buf.geterror()}")
     if not buf.write(str(path)):
         raise RuntimeError(f"OIIO write failed: {path} — {buf.geterror()}")
 
@@ -118,5 +98,4 @@ def write_normal_exr(path: Path, normal: np.ndarray) -> None:
     norm = np.linalg.norm(n, axis=-1, keepdims=True)
     n = n / np.maximum(norm, 1e-8)
     n = np.clip(n, -1.0, 1.0)
-    n = _to_float32_c(n)
-    write_exr_float(path, n, channels=3)
+    write_exr_float(path, _to_float32_c(n), channels=3)
