@@ -182,36 +182,83 @@ def _frame_count(frame_start: int, frame_end: int) -> int:
     return max(0, frame_end - frame_start + 1)
 
 
-def _exr_count(folder: Path) -> int:
+def _exr_count(folder: Path, *, recursive: bool = False) -> int:
     if not folder.is_dir():
         return 0
+    if recursive:
+        return len(list(folder.rglob("*.exr")))
     return len(list(folder.glob("*.exr")))
+
+
+def _matte_layout(shared: dict[str, Any]) -> str:
+    layout = str(shared.get("matte_subject_layout") or "combined").strip().lower()
+    return layout if layout in ("combined", "channels", "separate") else "combined"
+
+
+def _matte_complete(matte_dir: Path, n_frames: int, layout: str) -> bool:
+    if not matte_dir.is_dir():
+        return False
+    if layout == "separate":
+        subdirs = sorted(
+            d for d in matte_dir.iterdir() if d.is_dir() and d.name.startswith("p")
+        )
+        if subdirs:
+            return any(_exr_count(d) >= n_frames for d in subdirs)
+        return _exr_count(matte_dir) >= n_frames
+    return _exr_count(matte_dir) >= n_frames
 
 
 def _pass_done_local_or_drive(
     local_dir: Path,
     drive_dir: Path,
     n_frames: int,
+    *,
+    is_matte: bool = False,
+    matte_layout: str = "combined",
 ) -> bool:
+    if is_matte:
+        if _matte_complete(local_dir, n_frames, matte_layout):
+            return True
+        return _matte_complete(drive_dir, n_frames, matte_layout)
     if _exr_count(local_dir) >= n_frames:
         return True
     return _exr_count(drive_dir) >= n_frames
 
 
 def _copy_exr_folder_to_drive(local_dir: Path, drive_dir: Path, label: str) -> int:
-    """VDA-style: shutil.copy2 local EXRs → Drive (called only when shot/batch is done)."""
+    """Copy EXRs (top-level + p00/… subdirs) local → Drive."""
     local_dir = Path(local_dir)
     drive_dir = Path(drive_dir)
     if not local_dir.is_dir():
+        _log.warning("[SAVE] No local %s dir: %s", label, local_dir)
         return 0
     drive_dir.mkdir(parents=True, exist_ok=True)
     n = 0
-    for src in sorted(local_dir.glob("*.exr")):
-        dest = drive_dir / src.name
+    for src in sorted(local_dir.rglob("*.exr")):
+        rel = src.relative_to(local_dir)
+        dest = drive_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
         n += 1
     if n:
         _log.info("[OK] Saved %d %s EXR → %s", n, label, drive_dir)
+    else:
+        _log.warning("[SAVE] 0 %s EXR copied from %s", label, local_dir)
+    return n
+
+
+def _copy_qc_to_drive(local_shot: Path, drive_shot: Path) -> int:
+    local_qc = Path(local_shot) / "qc"
+    if not local_qc.is_dir():
+        return 0
+    drive_qc = Path(drive_shot) / "qc"
+    drive_qc.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for src in sorted(local_qc.glob("*.mp4")):
+        shutil.copy2(src, drive_qc / src.name)
+        n += 1
+    if n:
+        _log.info("[OK] Saved %d QC MP4 → %s", n, drive_qc)
     return n
 
 
@@ -282,7 +329,14 @@ def _run_shot(
     export_matte = bool(shared.get("export_matte_exr", True))
     export_normal = bool(shared.get("export_normal_exr", True))
 
-    matte_done = _pass_done_local_or_drive(matte_local, matte_drive, n_frames) if export_matte else True
+    matte_layout = _matte_layout(shared)
+    matte_done = (
+        _pass_done_local_or_drive(
+            matte_local, matte_drive, n_frames, is_matte=True, matte_layout=matte_layout
+        )
+        if export_matte
+        else True
+    )
     normal_done = _pass_done_local_or_drive(normal_local, normal_drive, n_frames) if export_normal else True
 
     local_shot.mkdir(parents=True, exist_ok=True)
@@ -415,8 +469,11 @@ def _run_shot(
         if proc is not None:
             proc.unload()
 
-    if export_matte and run_matting and _exr_count(matte_local) < n_frames:
-        raise RuntimeError(f"Incomplete matte on local: {_exr_count(matte_local)}/{n_frames}")
+    if export_matte and run_matting and not _matte_complete(matte_local, n_frames, matte_layout):
+        raise RuntimeError(
+            f"Incomplete matte on local (layout={matte_layout}): "
+            f"{_exr_count(matte_local, recursive=True)}/{n_frames}"
+        )
     if export_normal and run_normal and _exr_count(normal_local) < n_frames:
         raise RuntimeError(f"Incomplete normal on local: {_exr_count(normal_local)}/{n_frames}")
 
@@ -443,12 +500,18 @@ def _run_shot(
             _log.warning("QC MP4 export failed for %s: %s", shot, exc)
 
     if save_to_drive:
-        _log.info("[SAVE] Copying %s → Drive...", shot)
-        _save_shot_to_drive(shot, shared, export_matte=export_matte, export_normal=export_normal)
+        _log.info("[SAVE] Copying %s → Drive (%s)...", shot, drive_shot)
+        try:
+            _save_shot_to_drive(shot, shared, export_matte=export_matte, export_normal=export_normal)
+        except Exception as exc:
+            raise RuntimeError(f"Drive copy failed for {shot}: {exc}") from exc
 
     if save_to_drive:
-        if export_matte and _exr_count(matte_drive) < n_frames:
-            raise RuntimeError(f"Incomplete matte on Drive: {_exr_count(matte_drive)}/{n_frames}")
+        if export_matte and not _matte_complete(matte_drive, n_frames, matte_layout):
+            raise RuntimeError(
+                f"Incomplete matte on Drive (layout={matte_layout}): "
+                f"{_exr_count(matte_drive, recursive=True)}/{n_frames}"
+            )
         if export_normal and _exr_count(normal_drive) < n_frames:
             raise RuntimeError(f"Incomplete normal on Drive: {_exr_count(normal_drive)}/{n_frames}")
         _log.info("[OK] Shot %s on Drive: %s", shot, drive_shot)
