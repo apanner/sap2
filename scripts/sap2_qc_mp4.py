@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""QC MP4 previews for SAP2 matte + normal EXR (LAOV-style plate overlay)."""
+"""QC MP4 previews for SAP2 matte + normal EXR (LAOV-style plate overlay, HD proxy)."""
 
 from __future__ import annotations
 
 import logging
 import re
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
@@ -17,7 +16,9 @@ _log = logging.getLogger("sap2_qc_mp4")
 _FRAME_RE = re.compile(r"_(\d{4,8})\.exr$", re.IGNORECASE)
 _SUBJECT_DIR_RE = re.compile(r"^p(\d{2})$")
 
-# R,G,B,A person slot colors (channels layout)
+# Default: 1920px long edge → 1080×1920 for portrait 4K plates, 1920×1080 for landscape
+DEFAULT_QC_MAX_LONG_EDGE = 1920
+
 _SLOT_COLORS = (
     (1.0, 0.0, 0.0),
     (0.0, 1.0, 0.0),
@@ -37,6 +38,64 @@ def _sorted_exrs(folder: Path) -> list[tuple[int, Path]]:
     return sorted(by_frame.items(), key=lambda x: x[0])
 
 
+def _fit_long_edge_uint8(img: np.ndarray, max_long: int) -> np.ndarray:
+    """Downscale for QC (HD): keep aspect, long edge <= max_long."""
+    import cv2
+
+    if img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    h, w = img.shape[:2]
+    long_edge = max(h, w)
+    if long_edge <= max_long:
+        return np.ascontiguousarray(img)
+    scale = max_long / float(long_edge)
+    nw = max(2, int(round(w * scale)))
+    nh = max(2, int(round(h * scale)))
+    if nw % 2:
+        nw += 1
+    if nh % 2:
+        nh += 1
+    return cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+
+
+def _resize_frame_uint8(img: np.ndarray, h: int, w: int) -> np.ndarray:
+    import cv2
+
+    if img.shape[0] == h and img.shape[1] == w:
+        return np.ascontiguousarray(img)
+    return cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+
+
+def _write_mp4(frames_rgb: list[np.ndarray], out_path: Path, fps: float) -> None:
+    if not frames_rgb:
+        raise ValueError("no frames to encode")
+    h, w = frames_rgb[0].shape[:2]
+    stack = np.stack([_resize_frame_uint8(f, h, w) for f in frames_rgb], axis=0)
+    try:
+        import imageio.v3 as iio
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        iio.imwrite(
+            out_path,
+            stack,
+            fps=fps,
+            codec="libx264",
+            pixelformat="yuv420p",
+            quality=8,
+        )
+    except Exception:
+        import imageio as iio  # type: ignore[no-redef]
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        iio.mimsave(
+            str(out_path),
+            list(stack),
+            fps=fps,
+            codec="libx264",
+            ffmpeg_params=["-crf", "20", "-pix_fmt", "yuv420p"],
+        )
+
+
 def _channel_plane(
     pixels: np.ndarray, names: tuple[str, ...], channel: str
 ) -> np.ndarray | None:
@@ -52,24 +111,6 @@ def _overlay_plate(plate_rgb: np.ndarray, rgb: np.ndarray, *, alpha_scale: float
     a = np.max(tint, axis=-1, keepdims=True)
     out = plate * (1.0 - alpha_scale * a) + tint * (alpha_scale * a)
     return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
-
-
-def _write_mp4(frames_rgb: list[np.ndarray], out_path: Path, fps: float) -> None:
-    if not frames_rgb:
-        raise ValueError("no frames to encode")
-    try:
-        import imageio.v3 as iio
-    except ImportError:
-        import imageio as iio  # type: ignore[no-redef]
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    iio.imwrite(
-        out_path,
-        np.stack(frames_rgb, axis=0),
-        fps=fps,
-        codec="libx264",
-        ffmpeg_params=["-crf", "18", "-pix_fmt", "yuv420p"],
-    )
 
 
 def _read_plate_bgr(
@@ -110,12 +151,10 @@ def _matte_combined_rgb(pixels: np.ndarray, names: tuple[str, ...]) -> np.ndarra
 
 
 def _matte_channels_rgb(pixels: np.ndarray, names: tuple[str, ...]) -> np.ndarray | None:
-    """R,G,B,A EXR planes → red/green/blue/white matte preview."""
     h, w = pixels.shape[0], pixels.shape[1]
     rgb = np.zeros((h, w, 3), dtype=np.float32)
     any_ch = False
-    ch_names = ("R", "G", "B", "A")
-    for i, ch in enumerate(ch_names):
+    for i, ch in enumerate(("R", "G", "B", "A")):
         if i >= len(_SLOT_COLORS):
             break
         plane = _channel_plane(pixels, names, ch)
@@ -138,6 +177,22 @@ def _normal_display_rgb(pixels: np.ndarray, names: tuple[str, ...]) -> np.ndarra
     return np.clip(n * 0.5 + 0.5, 0.0, 1.0)
 
 
+def _frame_to_hd_uint8(
+    rgb: np.ndarray,
+    plate_cache_dir: Path | None,
+    frame_idx: int,
+    *,
+    max_long: int,
+    use_plate_overlay: bool,
+) -> np.ndarray:
+    plate = _read_plate_bgr(plate_cache_dir, frame_idx)
+    if use_plate_overlay and plate is not None and plate.shape[:2] == rgb.shape[:2]:
+        out = _overlay_plate(plate, rgb)
+    else:
+        out = (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+    return _fit_long_edge_uint8(out, max_long)
+
+
 def _export_stage_mp4(
     stage_dir: Path,
     qc_dir: Path,
@@ -147,12 +202,14 @@ def _export_stage_mp4(
     *,
     plate_cache_dir: Path | None,
     fps: float,
+    max_long: int,
 ) -> Path | None:
     entries = _sorted_exrs(stage_dir)
     if not entries:
         return None
 
     frames_rgb: list[np.ndarray] = []
+    use_overlay = vis_kind != "normal"
     for frame_idx, exr_path in entries:
         pixels, names = read_exr_pixels(exr_path)
         if vis_kind == "matte_combined":
@@ -165,22 +222,23 @@ def _export_stage_mp4(
             rgb = _matte_combined_rgb(pixels, names)
         if rgb is None:
             continue
-        plate = _read_plate_bgr(plate_cache_dir, frame_idx)
-        if plate is not None and plate.shape[:2] == rgb.shape[:2]:
-            frames_rgb.append(_overlay_plate(plate, rgb))
-        else:
-            frames_rgb.append((rgb * 255.0).astype(np.uint8))
+        frames_rgb.append(
+            _frame_to_hd_uint8(
+                rgb,
+                plate_cache_dir,
+                frame_idx,
+                max_long=max_long,
+                use_plate_overlay=use_overlay,
+            )
+        )
 
     if not frames_rgb:
         return None
     out = qc_dir / f"{shot_label}_{suffix}_qc.mp4"
     _write_mp4(frames_rgb, out, fps)
-    _log.info("QC MP4 (%s): %s", suffix, out)
+    h, w = frames_rgb[0].shape[:2]
+    _log.info("QC MP4 (%s): %s (%dx%d HD)", suffix, out, w, h)
     return out
-
-
-def _concat_horizontal(parts: list[np.ndarray]) -> np.ndarray:
-    return np.concatenate(parts, axis=1)
 
 
 def _export_review_mp4(
@@ -191,61 +249,92 @@ def _export_review_mp4(
     plate_cache_dir: Path | None,
     matte_layout: str,
     fps: float,
+    max_long: int,
 ) -> Path | None:
-    """Single MP4: plate | matte | normal (when folders exist)."""
+    """HD 3-up: plate | matte | normal — fixed panel size every frame."""
     normal_dir = shot_dir / "normal"
     matte_dir = shot_dir / "matte"
     normal_entries = _sorted_exrs(normal_dir)
     if not normal_entries:
         return None
 
-    matte_vis = "matte_channels" if matte_layout == "channels" else "matte_combined"
     frames: list[np.ndarray] = []
+    panel_h, panel_w = 0, 0
+
     for frame_idx, norm_path in normal_entries:
         norm_px, norm_names = read_exr_pixels(norm_path)
         norm_rgb = _normal_display_rgb(norm_px, norm_names)
         if norm_rgb is None:
             continue
 
-        parts: list[np.ndarray] = []
         plate = _read_plate_bgr(plate_cache_dir, frame_idx)
-        if plate is not None:
-            parts.append((np.clip(plate, 0, 1) * 255.0).astype(np.uint8))
-
         matte_rgb = None
         if matte_layout == "separate":
             for sub in sorted(matte_dir.iterdir()) if matte_dir.is_dir() else []:
                 if sub.is_dir() and _SUBJECT_DIR_RE.match(sub.name):
-                    exrs = _sorted_exrs(sub)
-                    exr_map = dict(exrs)
+                    exr_map = dict(_sorted_exrs(sub))
                     if frame_idx in exr_map:
                         px, names = read_exr_pixels(exr_map[frame_idx])
                         matte_rgb = _matte_combined_rgb(px, names)
                         break
         else:
-            exrs = dict(_sorted_exrs(matte_dir))
-            if frame_idx in exrs:
-                px, names = read_exr_pixels(exrs[frame_idx])
+            exr_map = dict(_sorted_exrs(matte_dir))
+            if frame_idx in exr_map:
+                px, names = read_exr_pixels(exr_map[frame_idx])
                 matte_rgb = (
                     _matte_channels_rgb(px, names)
                     if matte_layout == "channels"
                     else _matte_combined_rgb(px, names)
                 )
 
-        if matte_rgb is not None:
+        ref = plate if plate is not None else norm_rgb
+        ref_u8 = _fit_long_edge_uint8(
+            (np.clip(ref, 0, 1) * 255).astype(np.uint8) if ref.dtype != np.uint8 else ref,
+            max_long,
+        )
+        ph, pw = ref_u8.shape[:2]
+        if panel_h == 0:
+            panel_h, panel_w = ph, pw
+
+        black = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+        if plate is not None and plate.shape[:2] == norm_rgb.shape[:2]:
+            plate_p = _resize_frame_uint8(
+                _fit_long_edge_uint8((np.clip(plate, 0, 1) * 255).astype(np.uint8), max_long),
+                panel_h,
+                panel_w,
+            )
+        else:
+            plate_p = black.copy()
+
+        if matte_rgb is not None and matte_rgb.shape[:2] == norm_rgb.shape[:2]:
             if plate is not None and plate.shape[:2] == matte_rgb.shape[:2]:
-                parts.append(_overlay_plate(plate, matte_rgb))
+                matte_p = _resize_frame_uint8(
+                    _overlay_plate(plate, matte_rgb), panel_h, panel_w
+                )
             else:
-                parts.append((matte_rgb * 255.0).astype(np.uint8))
-        parts.append((norm_rgb * 255.0).astype(np.uint8))
-        if len(parts) >= 2:
-            frames.append(_concat_horizontal(parts))
+                matte_p = _resize_frame_uint8(
+                    _fit_long_edge_uint8((matte_rgb * 255).astype(np.uint8), max_long),
+                    panel_h,
+                    panel_w,
+                )
+        else:
+            matte_p = black.copy()
+
+        norm_p = _resize_frame_uint8(
+            _frame_to_hd_uint8(
+                norm_rgb, None, frame_idx, max_long=max_long, use_plate_overlay=False
+            ),
+            panel_h,
+            panel_w,
+        )
+        frames.append(np.concatenate([plate_p, matte_p, norm_p], axis=1))
 
     if not frames:
         return None
     out = qc_dir / f"{shot_label}_review_qc.mp4"
     _write_mp4(frames, out, fps)
-    _log.info("QC MP4 (review): %s", out)
+    fh, fw = frames[0].shape[:2]
+    _log.info("QC MP4 (review): %s (%dx%d HD)", out, fw, fh)
     return out
 
 
@@ -260,21 +349,18 @@ def export_sap2_qc_mp4s(
     export_matte: bool = True,
     export_normal: bool = True,
     include_review: bool = True,
+    qc_max_long_edge: int = DEFAULT_QC_MAX_LONG_EDGE,
 ) -> dict[str, Path]:
-    """
-    Write QC MP4s under ``<shot>/qc/`` (LAOV-style naming).
-
-    - ``{shot}_matte_qc.mp4`` — combined RGBA matte on plate
-    - ``{shot}_matte_channels_qc.mp4`` — R/G/B/A person alphas as colors
-    - ``{shot}_matte_p00_qc.mp4`` … — separate per-person folders
-    - ``{shot}_normal_qc.mp4`` — normals on plate
-    - ``{shot}_review_qc.mp4`` — plate | matte | normal (optional)
-    """
+    """Write HD QC MP4s under ``<shot>/qc/`` (long edge capped at ``qc_max_long_edge``)."""
     output_shot_dir = Path(output_shot_dir)
     qc_dir = output_shot_dir / "qc"
     shot_label = output_shot_dir.name
     layout = str(matte_subject_layout or "combined").strip().lower()
+    max_long = max(480, int(qc_max_long_edge))
     written: dict[str, Path] = {}
+    _log.info("QC encode: max long edge %d px (HD proxy)", max_long)
+
+    stage_kw = dict(plate_cache_dir=plate_cache_dir, fps=fps, max_long=max_long)
 
     if export_matte:
         matte_dir = output_shot_dir / "matte"
@@ -282,68 +368,59 @@ def export_sap2_qc_mp4s(
             for sub in sorted(matte_dir.iterdir()):
                 if not sub.is_dir() or not _SUBJECT_DIR_RE.match(sub.name):
                     continue
-                sid = sub.name
+                try:
+                    out = _export_stage_mp4(
+                        sub, qc_dir, shot_label, f"matte_{sub.name}", "matte_combined", **stage_kw
+                    )
+                    if out:
+                        written[f"matte_{sub.name}"] = out
+                except Exception as exc:
+                    _log.warning("QC matte %s failed: %s", sub.name, exc)
+        elif layout == "channels" and matte_dir.is_dir():
+            try:
                 out = _export_stage_mp4(
-                    sub,
-                    qc_dir,
-                    shot_label,
-                    f"matte_{sid}",
-                    "matte_combined",
-                    plate_cache_dir=plate_cache_dir,
-                    fps=fps,
+                    matte_dir, qc_dir, shot_label, "matte_channels", "matte_channels", **stage_kw
                 )
                 if out:
-                    written[f"matte_{sid}"] = out
-        elif layout == "channels" and matte_dir.is_dir():
-            out = _export_stage_mp4(
-                matte_dir,
-                qc_dir,
-                shot_label,
-                "matte_channels",
-                "matte_channels",
-                plate_cache_dir=plate_cache_dir,
-                fps=fps,
-            )
-            if out:
-                written["matte_channels"] = out
+                    written["matte_channels"] = out
+            except Exception as exc:
+                _log.warning("QC matte_channels failed: %s", exc)
         elif matte_dir.is_dir():
-            out = _export_stage_mp4(
-                matte_dir,
-                qc_dir,
-                shot_label,
-                "matte",
-                "matte_combined",
-                plate_cache_dir=plate_cache_dir,
-                fps=fps,
-            )
-            if out:
-                written["matte"] = out
+            try:
+                out = _export_stage_mp4(
+                    matte_dir, qc_dir, shot_label, "matte", "matte_combined", **stage_kw
+                )
+                if out:
+                    written["matte"] = out
+            except Exception as exc:
+                _log.warning("QC matte failed: %s", exc)
 
     if export_normal:
         normal_dir = output_shot_dir / "normal"
         if normal_dir.is_dir():
-            out = _export_stage_mp4(
-                normal_dir,
-                qc_dir,
-                shot_label,
-                "normal",
-                "normal",
-                plate_cache_dir=plate_cache_dir,
-                fps=fps,
-            )
-            if out:
-                written["normal"] = out
+            try:
+                out = _export_stage_mp4(
+                    normal_dir, qc_dir, shot_label, "normal", "normal", **stage_kw
+                )
+                if out:
+                    written["normal"] = out
+            except Exception as exc:
+                _log.warning("QC normal failed: %s", exc)
 
     if include_review and export_matte and export_normal:
-        out = _export_review_mp4(
-            output_shot_dir,
-            qc_dir,
-            shot_label,
-            plate_cache_dir=plate_cache_dir,
-            matte_layout=layout,
-            fps=fps,
-        )
-        if out:
-            written["review"] = out
+        try:
+            out = _export_review_mp4(
+                output_shot_dir,
+                qc_dir,
+                shot_label,
+                plate_cache_dir=plate_cache_dir,
+                matte_layout=layout,
+                fps=fps,
+                max_long=max_long,
+            )
+            if out:
+                written["review"] = out
+        except Exception as exc:
+            _log.warning("QC review failed (matte/normal MP4s kept): %s", exc)
 
     return written

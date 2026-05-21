@@ -43,6 +43,7 @@ SAP2_DEFAULTS: dict[str, Any] = {
     "plate_cache_workers": 12,
     "qc_mp4": True,
     "qc_fps": 24.0,
+    "qc_max_long_edge": 1920,
     "batch_one_process_per_shot": True,
     "split_pass_subprocess": False,
     "image_feed_mode": "auto",
@@ -493,6 +494,7 @@ def _run_shot(
                 matte_subject_layout=matte_layout,
                 export_matte=export_matte and run_matting,
                 export_normal=export_normal and run_normal,
+                qc_max_long_edge=int(shared.get("qc_max_long_edge", 1920)),
             )
             if not written:
                 _log.warning("%s: QC MP4 — no previews written (missing EXR?)", shot)

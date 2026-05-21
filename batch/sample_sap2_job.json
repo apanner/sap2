@@ -13,6 +13,7 @@
     "inference_long_edge": 0,
     "qc_mp4": true,
     "qc_fps": 24.0,
+    "qc_max_long_edge": 1920,
     "batch_one_process_per_shot": true,
     "batch_gap_seconds": 5,
     "checkpoint_root": "/content/sapiens2_checkpoints",

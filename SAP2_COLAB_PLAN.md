@@ -73,7 +73,7 @@ Same idea as LAOV: after EXR infer, build H.264 previews under `qc/` with **plat
 | `{shot}_normal_qc.mp4` | Surface normals (0.5·n+0.5) on plate |
 | `{shot}_review_qc.mp4` | 3-up: plate \| matte \| normal |
 
-Set `"qc_mp4": false` in JSON to skip. `"qc_fps": 24` optional.
+Set `"qc_mp4": false` in JSON to skip. `"qc_fps": 24` optional. **`qc_max_long_edge": 1920`** (default) downscales 4K plates to HD for fast MP4s (portrait → ~1080×1920).
 
 ### Multi-person matte (`matte_subject_layout`)
 
