@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SAP2 Colab batch — VDA-style: read plates from Drive, process on /content, sync EXR to Drive."""
+"""SAP2 Colab batch — same I/O as VDA: /content/output local, copy to Drive when done."""
 from __future__ import annotations
 
 import argparse
@@ -25,8 +25,8 @@ from plate_cache import build_plate_jpeg_cache, cache_path, plate_cache_complete
 
 _log = logging.getLogger("sap2_colab_run")
 
-# VDA pattern: all hot I/O on Colab local disk
-SAP2_LOCAL_ROOT = Path(os.environ.get("SAP2_LOCAL_WORK", "/content/sap2_work"))
+# VDA uses LOCAL_OUTPUT_PATH = '/content/output' — match exactly
+LOCAL_OUTPUT_PATH = "/content/output"
 
 SAP2_DEFAULTS: dict[str, Any] = {
     "sapiens_model": "1b",
@@ -45,7 +45,6 @@ SAP2_DEFAULTS: dict[str, Any] = {
     "download_models_in_colab": True,
     "inference_long_edge": 0,
     "inference_max_megapixels": 1.6,
-    "use_local_workdir": True,
 }
 
 from sap2_models import MODEL_CONFIGS  # noqa: E402
@@ -86,8 +85,8 @@ def _resolve_on_drive(rel_or_abs: str) -> Path:
     return drive / p.lstrip("/")
 
 
-def _local_root() -> Path:
-    return Path(os.environ.get("SAP2_LOCAL_WORK", str(SAP2_LOCAL_ROOT)))
+def _local_output_root() -> Path:
+    return Path(os.environ.get("SAP2_LOCAL_OUTPUT", LOCAL_OUTPUT_PATH))
 
 
 def _drive_output_root(shared: dict[str, Any]) -> Path:
@@ -97,7 +96,7 @@ def _drive_output_root(shared: dict[str, Any]) -> Path:
 
 
 def _local_shot_dir(shot: str) -> Path:
-    return _local_root() / _date_folder() / shot
+    return _local_output_root() / shot
 
 
 def _drive_shot_dir(shared: dict[str, Any], shot: str) -> Path:
@@ -147,29 +146,61 @@ def _exr_count(folder: Path) -> int:
     return len(list(folder.glob("*.exr")))
 
 
-def _sync_exr_folder(local_dir: Path, drive_dir: Path, label: str) -> int:
-    """Copy local EXRs to Drive (VDA-style save at end of pass)."""
+def _pass_done_local_or_drive(
+    local_dir: Path,
+    drive_dir: Path,
+    n_frames: int,
+) -> bool:
+    if _exr_count(local_dir) >= n_frames:
+        return True
+    return _exr_count(drive_dir) >= n_frames
+
+
+def _copy_exr_folder_to_drive(local_dir: Path, drive_dir: Path, label: str) -> int:
+    """VDA-style: shutil.copy2 local EXRs → Drive (called only when shot/batch is done)."""
     local_dir = Path(local_dir)
     drive_dir = Path(drive_dir)
-    drive_dir.mkdir(parents=True, exist_ok=True)
     if not local_dir.is_dir():
         return 0
+    drive_dir.mkdir(parents=True, exist_ok=True)
     n = 0
     for src in sorted(local_dir.glob("*.exr")):
         dest = drive_dir / src.name
-        if dest.is_file() and dest.stat().st_size == src.stat().st_size:
-            continue
         shutil.copy2(src, dest)
         n += 1
-    _log.info("[SAVE] %s → Drive %s (%d file(s) copied)", label, drive_dir, n)
+    if n:
+        _log.info("[OK] Saved %d %s EXR → %s", n, label, drive_dir)
     return n
+
+
+def _save_shot_to_drive(
+    shot: str,
+    shared: dict[str, Any],
+    *,
+    export_matte: bool,
+    export_normal: bool,
+) -> None:
+    local_shot = _local_shot_dir(shot)
+    drive_shot = _drive_shot_dir(shared, shot)
+    drive_shot.mkdir(parents=True, exist_ok=True)
+    if export_matte:
+        _copy_exr_folder_to_drive(local_shot / "matte", drive_shot / "matte", "matte")
+    if export_normal:
+        _copy_exr_folder_to_drive(local_shot / "normal", drive_shot / "normal", "normal")
+
+
+def _is_last_pass(pass_name: str, shared: dict[str, Any]) -> bool:
+    if pass_name == "all":
+        return True
+    passes = _enabled_passes(shared)
+    return bool(passes) and pass_name == passes[-1]
 
 
 def _preflight_plate(plate_dir: Path, pattern: str, frame_start: int) -> None:
     first = pattern_to_path(plate_dir, pattern, frame_start)
     if not first.is_file():
         raise FileNotFoundError(f"Plate not found on Drive: {first}")
-    _log.info("Plate OK (Drive read): %s", first)
+    _log.info("Plate OK (read from Drive): %s", first)
 
 
 def _run_shot(
@@ -178,7 +209,8 @@ def _run_shot(
     ckpt_root: Path,
     *,
     pass_name: str = "all",
-) -> None:
+    save_to_drive: bool = False,
+) -> str:
     shot = str(seq.get("shot_name") or seq.get("name") or "shot")
     plate_dir = _resolve_on_drive(str(seq["plate_dir"]))
     pattern = str(seq.get("plate_pattern") or "%06d.exr")
@@ -198,8 +230,8 @@ def _run_shot(
     cfg = MODEL_CONFIGS.get(model_key, MODEL_CONFIGS["1b"])
 
     _log.info("=== Shot %s frames %d-%d pass=%s ===", shot, frame_start, frame_end, pass_name)
-    _log.info("Local work: %s", local_shot.resolve())
-    _log.info("Drive save: %s", drive_shot.resolve())
+    _log.info("Local output: %s", local_shot.resolve())
+    _log.info("Drive deliverable (after done): %s", drive_shot.resolve())
     _preflight_plate(plate_dir, pattern, frame_start)
 
     run_matting = bool(shared.get("run_matting", True)) and pass_name in ("matting", "all")
@@ -207,15 +239,15 @@ def _run_shot(
     export_matte = bool(shared.get("export_matte_exr", True))
     export_normal = bool(shared.get("export_normal_exr", True))
 
-    # Resume from Drive (persistent)
-    matte_done = _exr_count(matte_drive) >= n_frames if export_matte else True
-    normal_done = _exr_count(normal_drive) >= n_frames if export_normal else True
+    matte_done = _pass_done_local_or_drive(matte_local, matte_drive, n_frames) if export_matte else True
+    normal_done = _pass_done_local_or_drive(normal_local, normal_drive, n_frames) if export_normal else True
 
     local_shot.mkdir(parents=True, exist_ok=True)
+    _local_output_root().mkdir(parents=True, exist_ok=True)
 
     if bool(shared.get("use_plate_jpeg_cache", True)):
         if not plate_cache_complete(cache_dir, frame_start, frame_end):
-            _log.info("EXR→JPEG on local disk (read plates once from Drive)...")
+            _log.info("EXR→JPEG cache on %s (read plates from Drive)...", LOCAL_OUTPUT_PATH)
             build_plate_jpeg_cache(
                 plate_dir,
                 pattern,
@@ -226,7 +258,7 @@ def _run_shot(
                 workers=int(shared.get("plate_cache_workers", 12)),
             )
         else:
-            _log.info("Local JPEG cache ready — %s", cache_dir)
+            _log.info("JPEG cache ready: %s", cache_dir)
 
     long_edge = int(shared.get("inference_long_edge", 0))
     max_mp = float(shared.get("inference_max_megapixels", 1.6))
@@ -267,13 +299,11 @@ def _run_shot(
                 write_alpha_exr(exr_out, alpha)
                 done += 1
                 if done == 1 or done % 10 == 0 or done == n_frames:
-                    _log.info("Matte local %d/%d", done, n_frames)
+                    _log.info("Matte → local %d/%d", done, n_frames)
         finally:
             proc.unload()
-        if export_matte:
-            _sync_exr_folder(matte_local, matte_drive, "matte")
     elif run_matting:
-        _log.info("Skip matting — %d EXRs on Drive", _exr_count(matte_drive))
+        _log.info("Skip matting (local=%d drive=%d)", _exr_count(matte_local), _exr_count(matte_drive))
 
     if run_normal and not normal_done:
         ckpt = ckpt_root / cfg["normal_ckpt"]
@@ -295,27 +325,38 @@ def _run_shot(
                 write_normal_exr(exr_out, normal)
                 done += 1
                 if done == 1 or done % 10 == 0 or done == n_frames:
-                    _log.info("Normal local %d/%d", done, n_frames)
+                    _log.info("Normal → local %d/%d", done, n_frames)
         finally:
             proc.unload()
-        if export_normal:
-            _sync_exr_folder(normal_local, normal_drive, "normal")
     elif run_normal:
-        _log.info("Skip normal — %d EXRs on Drive", _exr_count(normal_drive))
+        _log.info("Skip normal (local=%d drive=%d)", _exr_count(normal_local), _exr_count(normal_drive))
 
-    if export_matte and run_matting and _exr_count(matte_drive) < n_frames:
-        raise RuntimeError(f"Incomplete matte on Drive: {_exr_count(matte_drive)}/{n_frames}")
-    if export_normal and run_normal and _exr_count(normal_drive) < n_frames:
-        raise RuntimeError(f"Incomplete normal on Drive: {_exr_count(normal_drive)}/{n_frames}")
+    if export_matte and run_matting and _exr_count(matte_local) < n_frames:
+        raise RuntimeError(f"Incomplete matte on local: {_exr_count(matte_local)}/{n_frames}")
+    if export_normal and run_normal and _exr_count(normal_local) < n_frames:
+        raise RuntimeError(f"Incomplete normal on local: {_exr_count(normal_local)}/{n_frames}")
 
-    _log.info("[OK] Shot %s — results on Drive: %s", shot, drive_shot)
+    if save_to_drive:
+        _log.info("[SAVE] Copying %s → Drive...", shot)
+        _save_shot_to_drive(shot, shared, export_matte=export_matte, export_normal=export_normal)
+
+    if save_to_drive:
+        if export_matte and _exr_count(matte_drive) < n_frames:
+            raise RuntimeError(f"Incomplete matte on Drive: {_exr_count(matte_drive)}/{n_frames}")
+        if export_normal and _exr_count(normal_drive) < n_frames:
+            raise RuntimeError(f"Incomplete normal on Drive: {_exr_count(normal_drive)}/{n_frames}")
+        _log.info("[OK] Shot %s on Drive: %s", shot, drive_shot)
+    else:
+        _log.info("[OK] Shot %s on local %s (Drive copy pending)", shot, local_shot)
+
+    return shot
 
 
 def _subprocess_env() -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("SAP2_DRIVE_MOUNT", "/content/drive/MyDrive")
-    env.setdefault("SAP2_LOCAL_WORK", "/content/sap2_work")
+    env.setdefault("SAP2_LOCAL_OUTPUT", LOCAL_OUTPUT_PATH)
     return env
 
 
@@ -336,28 +377,56 @@ def _run_batch(job_path: Path, shot_index: int | None, pass_name: str) -> int:
         _log.error("No sequences")
         return 1
 
-    _local_root().mkdir(parents=True, exist_ok=True)
+    _local_output_root().mkdir(parents=True, exist_ok=True)
     ckpt_root = _checkpoint_root(shared)
     if pass_name == "all":
         _ensure_models_if_needed(shared, ckpt_root)
     os.environ["SAPIENS_CHECKPOINT_ROOT"] = str(ckpt_root)
 
-    _log.info("SAP2 local work → %s", _local_root().resolve())
-    _log.info("SAP2 Drive output → %s", _drive_output_root(shared).resolve())
-    _log.info("Checkpoints → %s", ckpt_root)
+    _log.info("Local output (VDA): %s", _local_output_root().resolve())
+    _log.info("Drive output: %s", _drive_output_root(shared).resolve())
+    _log.info("Checkpoints: %s", ckpt_root)
 
     if shot_index is not None:
         sequences = [sequences[shot_index]]
 
+    # VDA: process all shots locally first, then one [SAVE] block to Drive
+    batch_save_at_end = pass_name == "all" and shot_index is None and len(sequences) > 0
+    save_per_shot = _is_last_pass(pass_name, shared) and not batch_save_at_end
+
     failures: list[str] = []
+    completed: list[str] = []
     for i, seq in enumerate(sequences):
         shot = str(seq.get("shot_name") or f"seq_{i}")
         try:
-            _run_shot(seq, shared, ckpt_root, pass_name=pass_name)
+            _run_shot(
+                seq, shared, ckpt_root,
+                pass_name=pass_name,
+                save_to_drive=save_per_shot,
+            )
+            completed.append(shot)
         except Exception as exc:
             _log.error("[ERROR] %s: %s", shot, exc)
             _log.error(traceback.format_exc())
             failures.append(shot)
+
+    if batch_save_at_end and completed:
+        _log.info("=" * 60)
+        _log.info("[SAVE] Saving results to Drive...")
+        _log.info("=" * 60)
+        export_matte = bool(shared.get("export_matte_exr", True))
+        export_normal = bool(shared.get("export_normal_exr", True))
+        for shot in completed:
+            try:
+                _save_shot_to_drive(
+                    shot, shared,
+                    export_matte=export_matte,
+                    export_normal=export_normal,
+                )
+            except Exception as exc:
+                _log.error("[ERROR] Drive save %s: %s", shot, exc)
+                failures.append(shot)
+
     return 1 if failures else 0
 
 
@@ -375,15 +444,18 @@ def _run_orchestrated(job_path: Path) -> int:
     shared = _merge_shared(job)
     sequences = job.get("sequences") or []
     gap = int(shared.get("batch_gap_seconds", 5))
+    passes = _enabled_passes(shared)
     failures: list[str] = []
     for idx in range(len(sequences)):
         shot = str(sequences[idx].get("shot_name") or f"seq_{idx}")
-        for pn in _enabled_passes(shared):
+        for pn in passes:
             _log.info("--- %s / %s ---", shot, pn)
-            if _spawn_subprocess(job_path, idx, pn) != 0:
+            rc = _spawn_subprocess(job_path, idx, pn)
+            if rc != 0:
                 failures.append(f"{shot}:{pn}")
-            if gap > 0:
-                time.sleep(gap)
+                break
+        if gap > 0:
+            time.sleep(gap)
     return 1 if failures else 0
 
 

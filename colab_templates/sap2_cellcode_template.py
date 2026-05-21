@@ -1,5 +1,5 @@
 """
-SAP2 Colab cellcode — VDA-style: process on /content/sap2_work, save EXR to Drive at end.
+SAP2 Colab cellcode — VDA I/O: LOCAL_OUTPUT_PATH=/content/output, copy to Drive when done.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import traceback
 from datetime import datetime
 
 COLAB_CHECKPOINT_ROOT = "/content/sapiens2_checkpoints"
-SAP2_LOCAL_WORK = "/content/sap2_work"
+LOCAL_OUTPUT_PATH = "/content/output"  # same as VDA
 
 
 def setup_sap2_cell1(drive_service):
@@ -57,9 +57,9 @@ def load_sap2_config_cell2(drive_service, config_file_id):
     date_folder = datetime.now().strftime("%Y%m%d")
     os.environ["SAP2_DRIVE_MOUNT"] = drive
     os.environ["SAP2_RUNTIME_DATE_FOLDER"] = date_folder
-    os.environ["SAP2_LOCAL_WORK"] = SAP2_LOCAL_WORK
+    os.environ["SAP2_LOCAL_OUTPUT"] = LOCAL_OUTPUT_PATH
     os.environ["SAPIENS_CHECKPOINT_ROOT"] = COLAB_CHECKPOINT_ROOT
-    os.makedirs(SAP2_LOCAL_WORK, exist_ok=True)
+    os.makedirs(LOCAL_OUTPUT_PATH, exist_ok=True)
 
     logger = logging.getLogger("sap2_colab")
     if not logger.handlers:
@@ -68,10 +68,10 @@ def load_sap2_config_cell2(drive_service, config_file_id):
         logger.setLevel(logging.INFO)
 
     print("[OK] SAP2 config — batch=" + str(is_batch) + " date=" + date_folder)
-    print("   Local processing:", SAP2_LOCAL_WORK)
-    print("   Drive deliverables:", shared["output_folder_path"] + "/" + date_folder + "/SAP2_output/<shot>/")
-    print("   Models:", COLAB_CHECKPOINT_ROOT)
-    print("   Shots:", len(config.get("sequences") or []))
+    print("   Local output (process here): " + LOCAL_OUTPUT_PATH)
+    print("   Drive (copy when done): " + shared["output_folder_path"] + "/" + date_folder + "/SAP2_output/<shot>/")
+    print("   Models: " + COLAB_CHECKPOINT_ROOT)
+    print("   Shots: " + str(len(config.get("sequences") or [])))
     return config, drive, date_folder, logger, is_batch, config_path
 
 
@@ -108,11 +108,11 @@ def _run_sap2_batch(config_path: str, repo_url: str, date_folder: str) -> bool:
     env = os.environ.copy()
     env["SAP2_DRIVE_MOUNT"] = "/content/drive/MyDrive"
     env["SAP2_RUNTIME_DATE_FOLDER"] = date_folder
-    env["SAP2_LOCAL_WORK"] = SAP2_LOCAL_WORK
+    env["SAP2_LOCAL_OUTPUT"] = LOCAL_OUTPUT_PATH
     env["SAPIENS_CHECKPOINT_ROOT"] = COLAB_CHECKPOINT_ROOT
 
     cmd = [sys.executable, "scripts/sap2_colab_run.py", "--job-json", config_path]
-    print("\n[sap2_colab_run] local work → sync EXR to Drive")
+    print("\n[sap2_colab_run] write EXR to " + LOCAL_OUTPUT_PATH + " → copy to Drive when done")
     print("       ", " ".join(cmd), flush=True)
     return _stream_subprocess(cmd, cwd=clone_dir, env=env) == 0
 
@@ -128,7 +128,7 @@ def process_sap2_cell3(config, drive_base_path, date_folder, logger, is_batch, c
         or "https://github.com/apanner/sap2.git"
     )
     print("\n" + "=" * 60)
-    print("SAP2 — local process (fast) → save to Drive")
+    print("[SAVE] SAP2: process on " + LOCAL_OUTPUT_PATH + ", then copy to Drive")
     print("=" * 60)
     try:
         ok = _run_sap2_batch(config_path, git_url, date_folder)
