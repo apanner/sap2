@@ -45,9 +45,21 @@ def load_sap2_config_cell2(drive_service, config_file_id):
         config = json.load(f)
     shared = config.get("shared") or config.get("shared_settings") or {}
     drive = "/content/drive/MyDrive"
-    out_base = str(shared.get("output_folder_path") or "VDA_output").strip().strip("/")
-    if not out_base.startswith("/content/drive"):
-        shared["output_folder_path"] = f"{drive}/{out_base}"
+    out_raw = str(shared.get("output_folder_path") or "VDA_output").strip().replace("\\", "/")
+    if out_raw.startswith("/content/drive/MyDrive/"):
+        out_path = out_raw
+    elif out_raw.startswith("/content/drive"):
+        marker = "/MyDrive/"
+        out_path = (
+            f"{drive}/{out_raw.split(marker)[-1].lstrip('/')}"
+            if marker in out_raw
+            else out_raw
+        )
+    elif out_raw.startswith("MyDrive/"):
+        out_path = f"{drive}/{out_raw[len('MyDrive/'):]}"
+    else:
+        out_path = f"{drive}/{out_raw.strip('/')}"
+    shared["output_folder_path"] = out_path
     config["shared"] = shared
     config["shared_settings"] = shared
     with open(config_path, "w", encoding="utf-8") as f:

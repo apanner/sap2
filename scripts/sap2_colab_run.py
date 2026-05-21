@@ -71,8 +71,22 @@ def _date_folder() -> str:
     return os.environ.get("SAP2_RUNTIME_DATE_FOLDER", time.strftime("%Y%m%d"))
 
 
+def _collapse_drive_path(p: str) -> str:
+    """Fix paths broken by strip('/') or repeated Cell2 prefixing."""
+    p = str(p or "").strip().replace("\\", "/")
+    if not p:
+        return ""
+    marker = "/MyDrive/"
+    if marker in p:
+        tail = p.split(marker)[-1]
+        return f"/content/drive/MyDrive/{tail.lstrip('/')}"
+    if p.startswith("content/drive/MyDrive/"):
+        return "/" + p
+    return p
+
+
 def _resolve_on_drive(rel_or_abs: str) -> Path:
-    p = str(rel_or_abs or "").strip().replace("\\", "/")
+    p = _collapse_drive_path(rel_or_abs)
     if not p:
         return _drive_mount()
     if p.startswith("/content/drive"):
@@ -80,9 +94,17 @@ def _resolve_on_drive(rel_or_abs: str) -> Path:
     if p.startswith("MyDrive/"):
         return _drive_mount() / p[len("MyDrive/") :]
     drive = _drive_mount()
-    if str(p).startswith(str(drive).replace("\\", "/")):
+    drive_s = str(drive).replace("\\", "/")
+    if p.startswith(drive_s):
         return Path(p)
     return drive / p.lstrip("/")
+
+
+def _output_folder_from_shared(shared: dict[str, Any]) -> str:
+    raw = str(shared.get("output_folder_path") or "VDA_output").strip().replace("\\", "/")
+    if raw.startswith("/content/drive") or raw.startswith("MyDrive/"):
+        return _collapse_drive_path(raw)
+    return raw.strip("/") or "VDA_output"
 
 
 def _local_output_root() -> Path:
@@ -91,8 +113,7 @@ def _local_output_root() -> Path:
 
 def _drive_output_root(shared: dict[str, Any]) -> Path:
     root_name = str(shared.get("sap2_output_root") or "SAP2_output")
-    out_base = str(shared.get("output_folder_path") or "VDA_output").strip().strip("/")
-    return _resolve_on_drive(out_base) / _date_folder() / root_name
+    return _resolve_on_drive(_output_folder_from_shared(shared)) / _date_folder() / root_name
 
 
 def _local_shot_dir(shot: str) -> Path:
@@ -115,17 +136,24 @@ def _checkpoint_root(shared: dict[str, Any]) -> Path:
     return Path(COLAB_CHECKPOINT_ROOT)
 
 
-def _ensure_models_if_needed(shared: dict[str, Any], ckpt_root: Path) -> None:
+def _ensure_models_if_needed(
+    shared: dict[str, Any],
+    ckpt_root: Path,
+    *,
+    pass_name: str = "all",
+) -> None:
     if not bool(shared.get("download_models_in_colab", True)):
         return
     from download_checkpoints_colab import ensure_checkpoints
 
-    _log.info("Download/check models → %s", ckpt_root)
+    run_matting = bool(shared.get("run_matting", True)) and pass_name in ("matting", "all")
+    run_normal = bool(shared.get("run_normal", True)) and pass_name in ("normal", "all")
+    _log.info("Download/check models → %s (pass=%s)", ckpt_root, pass_name)
     ensure_checkpoints(
         ckpt_root,
         sapiens_model=str(shared.get("sapiens_model", "1b")),
-        run_matting=bool(shared.get("run_matting", True)),
-        run_normal=bool(shared.get("run_normal", True)),
+        run_matting=run_matting,
+        run_normal=run_normal,
     )
 
 
@@ -379,8 +407,7 @@ def _run_batch(job_path: Path, shot_index: int | None, pass_name: str) -> int:
 
     _local_output_root().mkdir(parents=True, exist_ok=True)
     ckpt_root = _checkpoint_root(shared)
-    if pass_name == "all":
-        _ensure_models_if_needed(shared, ckpt_root)
+    _ensure_models_if_needed(shared, ckpt_root, pass_name=pass_name)
     os.environ["SAPIENS_CHECKPOINT_ROOT"] = str(ckpt_root)
 
     _log.info("Local output (VDA): %s", _local_output_root().resolve())
