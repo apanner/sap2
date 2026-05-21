@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Literal, Optional, Tuple
 
+CropMode = Literal["union", "per_person", "largest"]
+
 import cv2
 import numpy as np
 
@@ -35,6 +37,7 @@ CAFFEMODEL_URLS = (
 )
 
 DetBackend = Literal["mobilenet", "hog"]
+MAX_MATTE_SUBJECTS = 4
 
 
 @dataclass
@@ -64,6 +67,44 @@ class BBox:
 
     def as_slice(self) -> Tuple[slice, slice]:
         return slice(self.y1, self.y2), slice(self.x1, self.x2)
+
+
+def union_bbox(boxes: List[BBox]) -> BBox:
+    return BBox(
+        min(b.x1 for b in boxes),
+        min(b.y1 for b in boxes),
+        max(b.x2 for b in boxes),
+        max(b.y2 for b in boxes),
+    )
+
+
+def _bbox_iou(a: BBox, b: BBox) -> float:
+    ix1 = max(a.x1, b.x1)
+    iy1 = max(a.y1, b.y1)
+    ix2 = min(a.x2, b.x2)
+    iy2 = min(a.y2, b.y2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter <= 0:
+        return 0.0
+    union = a.area() + b.area() - inter
+    return inter / max(union, 1)
+
+
+def sort_boxes_left_to_right(boxes: List[BBox]) -> List[BBox]:
+    """Stable subject index across frames: left → right by bbox center."""
+    return sorted(boxes, key=lambda b: (b.x1 + b.x2) * 0.5)
+
+
+def dedupe_boxes(boxes: List[BBox], *, iou_thresh: float = 0.45) -> List[BBox]:
+    """Keep highest-area box when two detections overlap heavily."""
+    if len(boxes) <= 1:
+        return boxes
+    ranked = sorted(boxes, key=lambda b: b.area(), reverse=True)
+    kept: List[BBox] = []
+    for box in ranked:
+        if all(_bbox_iou(box, k) < iou_thresh for k in kept):
+            kept.append(box)
+    return kept
 
 
 def _download_file(url: str, dest: Path, *, min_bytes: int = 1) -> bool:
@@ -177,10 +218,10 @@ class PersonDetector:
         )
         return small, scale
 
-    def _detect_mobilenet(self, image_bgr: np.ndarray) -> List[BBox]:
+    def _detect_mobilenet(self, image_bgr: np.ndarray, *, det_long: int = 1280) -> List[BBox]:
         assert self._net is not None
         h, w = image_bgr.shape[:2]
-        det_img, scale = self._scaled_image(image_bgr)
+        det_img, scale = self._scaled_image(image_bgr, det_long=det_long)
         dh, dw = det_img.shape[:2]
         blob = cv2.dnn.blobFromImage(
             det_img, scalefactor=0.007843, size=(300, 300), mean=127.5
@@ -203,9 +244,9 @@ class PersonDetector:
                 boxes.append(BBox(x1, y1, x2, y2).clamp(w, h))
         return boxes
 
-    def _detect_hog(self, image_bgr: np.ndarray) -> List[BBox]:
+    def _detect_hog(self, image_bgr: np.ndarray, *, det_long: int = 1280) -> List[BBox]:
         h, w = image_bgr.shape[:2]
-        det_img, scale = self._scaled_image(image_bgr)
+        det_img, scale = self._scaled_image(image_bgr, det_long=det_long)
         rects, _weights = self._hog.detectMultiScale(
             det_img,
             winStride=(8, 8),
@@ -233,14 +274,17 @@ class PersonCropTracker:
     def __init__(
         self,
         *,
-        pad_ratio: float = 0.18,
-        min_confidence: float = 0.35,
+        pad_ratio: float = 0.22,
+        min_confidence: float = 0.28,
         smooth_alpha: float = 0.72,
-        merge_multi: bool = True,
+        crop_mode: CropMode = "union",
+        merge_multi: bool | None = None,
         weights_dir: Path | None = None,
     ):
         self.pad_ratio = float(pad_ratio)
-        self.merge_multi = bool(merge_multi)
+        if merge_multi is not None and not crop_mode:
+            crop_mode = "per_person" if merge_multi else "largest"
+        self.crop_mode: CropMode = crop_mode  # type: ignore[assignment]
         self.smooth_alpha = float(smooth_alpha)
         self._detector = PersonDetector(
             min_confidence=min_confidence,
@@ -254,9 +298,11 @@ class PersonCropTracker:
         if not boxes:
             return []
         expanded = [b.expand(self.pad_ratio, img_w, img_h) for b in boxes]
-        if self.merge_multi:
-            return expanded
-        return [max(expanded, key=lambda b: b.area())]
+        if self.crop_mode == "largest":
+            return [max(expanded, key=lambda b: b.area())]
+        if self.crop_mode == "union":
+            return [union_bbox(expanded).clamp(img_w, img_h)]
+        return expanded
 
     def _smooth_one(self, box: BBox) -> BBox:
         if self._smooth is None:
@@ -283,7 +329,7 @@ class PersonCropTracker:
 
         crops: List[np.ndarray] = []
         boxes: List[BBox] = []
-        if self.merge_multi and len(picks) > 1:
+        if self.crop_mode == "per_person" and len(picks) > 1:
             for box in picks:
                 sy, sx = box.as_slice()
                 crops.append(image_bgr[sy, sx].copy())
@@ -293,18 +339,83 @@ class PersonCropTracker:
             sy, sx = box.as_slice()
             crops.append(image_bgr[sy, sx].copy())
             boxes.append(box)
+            if not getattr(self, "_crop_log_once", False):
+                self._crop_log_once = True
+                _log.info(
+                    "Person crop (%s): %d det → bbox [%d,%d,%d,%d] on %dx%d",
+                    self.crop_mode,
+                    len(raw),
+                    box.x1,
+                    box.y1,
+                    box.x2,
+                    box.y2,
+                    w,
+                    h,
+                )
+        return crops, boxes, False
+
+    def crop_regions_per_subject(
+        self, image_bgr: np.ndarray, *, max_subjects: int = MAX_MATTE_SUBJECTS
+    ) -> Tuple[List[np.ndarray], List[BBox], bool]:
+        """One crop per detected person (sorted left→right), up to max_subjects."""
+        h, w = image_bgr.shape[:2]
+        raw = sort_boxes_left_to_right(dedupe_boxes(self._detector.detect(image_bgr)))
+        if not raw:
+            self._full_frame_fallbacks += 1
+            if self._full_frame_fallbacks == 1:
+                _log.warning("No person detected — full-frame matte fallback (1 subject)")
+            return [image_bgr], [BBox(0, 0, w, h)], True
+
+        expanded = [b.expand(self.pad_ratio, w, h) for b in raw[:max_subjects]]
+        crops: List[np.ndarray] = []
+        boxes: List[BBox] = []
+        for box in expanded:
+            sy, sx = box.as_slice()
+            crops.append(image_bgr[sy, sx].copy())
+            boxes.append(box)
+        if not getattr(self, "_subject_crop_log_once", False):
+            self._subject_crop_log_once = True
+            _log.info(
+                "Per-subject matte: %d people (L→R indices 0..%d) on %dx%d",
+                len(boxes),
+                len(boxes) - 1,
+                w,
+                h,
+            )
         return crops, boxes, False
 
     @staticmethod
+    def _resize_crop_rgba(crop_rgba: np.ndarray, ch: int, cw: int) -> np.ndarray:
+        if crop_rgba.shape[:2] == (ch, cw):
+            return crop_rgba.astype(np.float32)
+        out = np.zeros((ch, cw, 4), dtype=np.float32)
+        for c in range(4):
+            out[:, :, c] = cv2.resize(
+                crop_rgba[:, :, c], (cw, ch), interpolation=cv2.INTER_LINEAR
+            )
+        return out.clip(0.0, 1.0)
+
+    @staticmethod
+    def paste_matte_rgba(
+        full_h: int, full_w: int, crop_rgba: np.ndarray, box: BBox
+    ) -> np.ndarray:
+        out = np.zeros((full_h, full_w, 4), dtype=np.float32)
+        sy, sx = box.as_slice()
+        ch, cw = sy.stop - sy.start, sx.stop - sx.start
+        out[sy, sx] = PersonCropTracker._resize_crop_rgba(crop_rgba, ch, cw)
+        return out
+
+    @staticmethod
     def paste_matte(full_h: int, full_w: int, crop_alpha: np.ndarray, box: BBox) -> np.ndarray:
+        """Legacy alpha-only paste (alpha plane from RGBA matte)."""
+        if crop_alpha.ndim == 3 and crop_alpha.shape[-1] == 4:
+            crop_alpha = crop_alpha[:, :, 3]
         out = np.zeros((full_h, full_w), dtype=np.float32)
         sy, sx = box.as_slice()
-        alpha = crop_alpha
         ch, cw = sy.stop - sy.start, sx.stop - sx.start
-        if alpha.shape[:2] != (ch, cw):
-            alpha = cv2.resize(alpha, (cw, ch), interpolation=cv2.INTER_LINEAR)
-        alpha = alpha.astype(np.float32).clip(0.0, 1.0)
-        out[sy, sx] = np.maximum(out[sy, sx], alpha)
+        if crop_alpha.shape[:2] != (ch, cw):
+            crop_alpha = cv2.resize(crop_alpha, (cw, ch), interpolation=cv2.INTER_LINEAR)
+        out[sy, sx] = np.maximum(out[sy, sx], crop_alpha.astype(np.float32).clip(0.0, 1.0))
         return out
 
     @staticmethod
@@ -321,12 +432,25 @@ class PersonCropTracker:
         out[sy, sx] = nrm
         return out
 
-    def merge_mattes(self, full_h: int, full_w: int, mattes: List[np.ndarray], boxes: List[BBox]) -> np.ndarray:
-        out = np.zeros((full_h, full_w), dtype=np.float32)
-        for alpha, box in zip(mattes, boxes):
-            layer = self.paste_matte(full_h, full_w, alpha, box)
-            np.maximum(out, layer, out=out)
+    def merge_mattes_rgba(
+        self, full_h: int, full_w: int, mattes: List[np.ndarray], boxes: List[BBox]
+    ) -> np.ndarray:
+        out = np.zeros((full_h, full_w, 4), dtype=np.float32)
+        for rgba, box in zip(mattes, boxes):
+            sy, sx = box.as_slice()
+            ch, cw = sy.stop - sy.start, sx.stop - sx.start
+            layer = self._resize_crop_rgba(rgba, ch, cw)
+            a_new = layer[:, :, 3]
+            a_old = out[sy, sx, 3]
+            take = a_new > a_old
+            for c in range(3):
+                out[sy, sx, c] = np.where(take, layer[:, :, c], out[sy, sx, c])
+            out[sy, sx, 3] = np.maximum(a_old, a_new)
         return out
+
+    def merge_mattes(self, full_h: int, full_w: int, mattes: List[np.ndarray], boxes: List[BBox]) -> np.ndarray:
+        rgba = self.merge_mattes_rgba(full_h, full_w, mattes, boxes)
+        return rgba[:, :, 3]
 
     def merge_normals(
         self, full_h: int, full_w: int, normals: List[np.ndarray], boxes: List[BBox]

@@ -51,8 +51,39 @@ Resume checks **Drive** EXR counts; infer missing frames locally; `shutil.copy2`
 
 MyDrive/VDA_output/{date}/SAP2_output/{shot}/   # persistent
 ├── matte/
+│   ├── matte_000001.exr          # layout=combined or channels
+│   ├── p00/matte_000001.exr      # layout=separate (per person)
+│   └── p01/…
 └── normal/
+├── qc/                              # when qc_mp4=true (LAOV-style)
+│   ├── {shot}_matte_qc.mp4
+│   ├── {shot}_normal_qc.mp4
+│   └── {shot}_review_qc.mp4         # plate | matte | normal
 ```
+
+### QC MP4 (`qc_mp4`, default **true**)
+
+Same idea as LAOV: after EXR infer, build H.264 previews under `qc/` with **plate overlay** from the JPEG cache.
+
+| File | Content |
+|------|---------|
+| `{shot}_matte_qc.mp4` | Combined matte (premult RGB or alpha) on plate |
+| `{shot}_matte_channels_qc.mp4` | R/G/B/A person masks as red/green/blue/white |
+| `{shot}_matte_p00_qc.mp4` | Per-person folder (`layout=separate`) |
+| `{shot}_normal_qc.mp4` | Surface normals (0.5·n+0.5) on plate |
+| `{shot}_review_qc.mp4` | 3-up: plate \| matte \| normal |
+
+Set `"qc_mp4": false` in JSON to skip. `"qc_fps": 24` optional.
+
+### Multi-person matte (`matte_subject_layout`)
+
+| Layout | Output | Nuke |
+|--------|--------|------|
+| **`combined`** (default) | One RGBA EXR — premult RGB + A, all people (union crop) | Single Read; one comp matte |
+| **`channels`** | One EXR — **R,G,B,A = alpha** for person 0,1,2,3 (left→right) | One Read; ShuffleCopy / Dot Product per channel |
+| **`separate`** | `matte/p00/`, `matte/p01/`, … full-plate RGBA per person | One Read per person; most flexible |
+
+Subject index is **left → right** by bbox center (stable across frames). Max **4** people (`matte_max_subjects`).
 
 ## Batch JSON (`model_type`: `SAP2_STANDALONE`)
 
@@ -68,7 +99,11 @@ Desk / manual JSON (same shape as LAOV batch):
     "run_normal": true,
     "image_feed_mode": "auto",
     "use_person_crop": true,
-    "person_crop_pad": 0.18,
+    "person_crop_pad": 0.22,
+    "person_crop_mode": "union",
+    "matte_subject_layout": "combined",
+    "qc_mp4": true,
+    "qc_fps": 24,
     "output_folder_path": "/content/drive/MyDrive/VDA_output"
   },
   "sequences": [

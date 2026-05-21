@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 from typing import Any, List, Literal
 
+MatteSubjectLayout = Literal["combined", "channels", "separate"]
+
 import cv2
 import numpy as np
 import torch
@@ -96,7 +98,7 @@ def _cuda_sync_cleanup() -> None:
 
 
 def _run_matting_on_bgr(model: Any, image_bgr: np.ndarray) -> np.ndarray:
-    """Official vis_matting path: any resolution in → full resolution alpha out."""
+    """Official vis_matting: 1×4×H×W premult RGB + alpha → H×W×4 float32."""
     out_h, out_w = image_bgr.shape[:2]
     data = model.pipeline(dict(img=image_bgr))
     data = model.data_preprocessor(data)
@@ -109,9 +111,10 @@ def _run_matting_on_bgr(model: Any, image_bgr: np.ndarray) -> np.ndarray:
         mode="bilinear",
         align_corners=False,
     )
-    alpha = out.squeeze(0)[3].float().cpu().numpy().clip(0.0, 1.0)
+    chw = out.squeeze(0).float().cpu().numpy().clip(0.0, 1.0)  # 4 x H x W
+    rgba = np.ascontiguousarray(chw.transpose(1, 2, 0), dtype=np.float32)
     del data, inputs, out
-    return np.ascontiguousarray(alpha, dtype=np.float32)
+    return rgba
 
 
 def _run_normal_on_bgr(model: Any, image_bgr: np.ndarray) -> np.ndarray:
@@ -158,10 +161,13 @@ class Sap2ShotProcessor:
         *,
         image_feed_mode: ImageFeedMode = "auto",
         use_person_crop: bool = True,
-        person_crop_pad: float = 0.18,
-        person_crop_confidence: float = 0.35,
+        person_crop_pad: float = 0.22,
+        person_crop_confidence: float = 0.28,
         person_crop_smooth: float = 0.72,
         person_crop_multi: bool = True,
+        person_crop_mode: str = "union",
+        matte_subject_layout: MatteSubjectLayout = "combined",
+        matte_max_subjects: int = 4,
     ):
         self.dense_root = Path(dense_root)
         self.ckpt_root = Path(ckpt_root)
@@ -173,6 +179,17 @@ class Sap2ShotProcessor:
         self._person_crop_confidence = person_crop_confidence
         self._person_crop_smooth = person_crop_smooth
         self._person_crop_multi = person_crop_multi
+        mode = str(person_crop_mode or "union").strip().lower()
+        if mode not in ("union", "per_person", "largest"):
+            mode = "union"
+        if not person_crop_multi:
+            mode = "largest"
+        self._person_crop_mode = mode
+        layout = str(matte_subject_layout or "combined").strip().lower()
+        if layout not in ("combined", "channels", "separate"):
+            layout = "combined"
+        self.matte_subject_layout: MatteSubjectLayout = layout  # type: ignore[assignment]
+        self.matte_max_subjects = max(1, min(4, int(matte_max_subjects)))
         self._matting_model = None
         self._normal_model = None
         self._crop_tracker = None
@@ -186,11 +203,14 @@ class Sap2ShotProcessor:
         if self._crop_tracker is None:
             from person_detect import PersonCropTracker
 
+            crop_mode = self._person_crop_mode
+            if self.matte_subject_layout in ("channels", "separate"):
+                crop_mode = "per_person"
             self._crop_tracker = PersonCropTracker(
                 pad_ratio=self._person_crop_pad,
                 min_confidence=self._person_crop_confidence,
                 smooth_alpha=self._person_crop_smooth,
-                merge_multi=self._person_crop_multi,
+                crop_mode=crop_mode,
             )
         return self._crop_tracker
 
@@ -250,10 +270,11 @@ class Sap2ShotProcessor:
         )
         _log.info("Normal model ready (native %d×%d + letterbox pad)", MODEL_NATIVE_H, MODEL_NATIVE_W)
 
-    def _process_matting_bgr(self, img: np.ndarray) -> np.ndarray:
+    def _process_matting_combined_bgr(self, img: np.ndarray) -> np.ndarray:
         h, w = img.shape[:2]
         use_crop = resolve_use_person_crop(
-            h, w,
+            h,
+            w,
             image_feed_mode=self.image_feed_mode,
             use_person_crop_flag=self.use_person_crop_flag,
         )
@@ -268,8 +289,37 @@ class Sap2ShotProcessor:
         crops, boxes, _ = tracker.crop_regions(img)
         mattes = [_run_matting_on_bgr(self._matting_model, c) for c in crops]
         if len(mattes) == 1:
-            return tracker.paste_matte(h, w, mattes[0], boxes[0])
-        return tracker.merge_mattes(h, w, mattes, boxes)
+            return tracker.paste_matte_rgba(h, w, mattes[0], boxes[0])
+        return tracker.merge_mattes_rgba(h, w, mattes, boxes)
+
+    def _process_matting_per_subject_bgr(self, img: np.ndarray) -> List[np.ndarray]:
+        """Full-plate RGBA matte per person (left→right index)."""
+        h, w = img.shape[:2]
+        use_crop = resolve_use_person_crop(
+            h,
+            w,
+            image_feed_mode=self.image_feed_mode,
+            use_person_crop_flag=self.use_person_crop_flag,
+        )
+        self._log_plate_once(h, w, use_crop)
+        self._ensure_matting()
+        assert self._matting_model is not None
+        tracker = self._crop_tracker_lazy()
+
+        if not use_crop:
+            return [_run_matting_on_bgr(self._matting_model, img)]
+
+        crops, boxes, _ = tracker.crop_regions_per_subject(
+            img, max_subjects=self.matte_max_subjects
+        )
+        layers: List[np.ndarray] = []
+        for crop, box in zip(crops, boxes):
+            rgba = _run_matting_on_bgr(self._matting_model, crop)
+            layers.append(tracker.paste_matte_rgba(h, w, rgba, box))
+        return layers
+
+    def _process_matting_bgr(self, img: np.ndarray) -> np.ndarray:
+        return self._process_matting_combined_bgr(img)
 
     def _process_normal_bgr(self, img: np.ndarray) -> np.ndarray:
         h, w = img.shape[:2]
@@ -295,7 +345,16 @@ class Sap2ShotProcessor:
     def process_frame_matting(self, jpeg_path: Path) -> np.ndarray:
         img = self._read_bgr(jpeg_path)
         try:
-            return self._process_matting_bgr(img)
+            return self._process_matting_combined_bgr(img)
+        finally:
+            _cuda_sync_cleanup()
+
+    def process_frame_matting_subjects(
+        self, jpeg_path: Path
+    ) -> List[np.ndarray]:
+        img = self._read_bgr(jpeg_path)
+        try:
+            return self._process_matting_per_subject_bgr(img)
         finally:
             _cuda_sync_cleanup()
 

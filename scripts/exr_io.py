@@ -27,6 +27,25 @@ def pattern_to_path(plate_dir: Path, pattern: str, frame: int) -> Path:
     return plate_dir / stem
 
 
+def read_exr_pixels(path: Path) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Read all channels as H×W×C float32 and channel names."""
+    oiio = require_oiio()
+    buf = oiio.ImageBuf(str(path))
+    if buf.has_error:
+        raise RuntimeError(f"OIIO read failed: {path} — {buf.geterror()}")
+    spec = buf.spec()
+    arr = buf.get_pixels(oiio.FLOAT)
+    if arr is None:
+        raise RuntimeError(f"OIIO get_pixels failed: {path}")
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[..., np.newaxis]
+    names = tuple(spec.channelnames) if spec.channelnames else tuple(
+        f"ch{i}" for i in range(arr.shape[-1])
+    )
+    return np.ascontiguousarray(arr, dtype=np.float32), names
+
+
 def read_plate_rgb(path: Path) -> np.ndarray:
     oiio = require_oiio()
     buf = oiio.ImageBuf(str(path))
@@ -70,6 +89,8 @@ def write_exr_float(path: Path, data: np.ndarray, *, channels: int | None = None
         spec.channelnames = ("A",)
     elif c == 3:
         spec.channelnames = ("R", "G", "B")
+    elif c == 4:
+        spec.channelnames = ("R", "G", "B", "A")
 
     buf = oiio.ImageBuf(spec)
     roi = oiio.ROI(0, w, 0, h, 0, 1, 0, c)
@@ -89,6 +110,39 @@ def write_exr_float(path: Path, data: np.ndarray, *, channels: int | None = None
 def write_alpha_exr(path: Path, alpha: np.ndarray) -> None:
     a = np.clip(_to_float32_c(alpha), 0.0, 1.0)
     write_exr_float(path, a, channels=1)
+
+
+def write_matte_exr(path: Path, matte_rgba: np.ndarray) -> None:
+    """Sapiens2 matte: premultiplied RGB + alpha (4 channels, Nuke R,G,B,A)."""
+    m = _to_float32_c(matte_rgba)
+    if m.ndim != 3 or m.shape[-1] != 4:
+        raise ValueError(f"matte must be HxWx4 (premult RGB + A), got {m.shape}")
+    m = np.clip(m, 0.0, 1.0)
+    write_exr_float(path, m, channels=4)
+
+
+def write_matte_subject_channels_exr(
+    path: Path,
+    subject_rgba: list[np.ndarray],
+    *,
+    max_subjects: int = 4,
+) -> None:
+    """
+    Pack per-person alpha into R,G,B,A (subject 0→R … 3→A).
+    Same layout as LAOV AI-matte multi-matte; one Read node in Nuke.
+    """
+    if not subject_rgba:
+        raise ValueError("subject_rgba is empty")
+    h, w = subject_rgba[0].shape[:2]
+    packed = np.zeros((h, w, max_subjects), dtype=np.float32)
+    for i, subj in enumerate(subject_rgba[:max_subjects]):
+        if subj.shape[:2] != (h, w):
+            raise ValueError(f"subject {i} shape {subj.shape} != {(h, w, 4)}")
+        if subj.shape[-1] == 4:
+            packed[:, :, i] = np.clip(subj[:, :, 3], 0.0, 1.0)
+        else:
+            packed[:, :, i] = np.clip(subj, 0.0, 1.0)
+    write_exr_float(path, packed, channels=max_subjects)
 
 
 def write_normal_exr(path: Path, normal: np.ndarray) -> None:

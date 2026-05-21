@@ -48,7 +48,8 @@ Per shot deliverables under `MyDrive/VDA_output/{date}/SAP2_output/{shot_name}/`
 
 | Folder | Content |
 |--------|---------|
-| `matte/` | Alpha EXR (`matte_000001.exr`, …) |
+| `matte/` | See `matte_subject_layout`: **combined** (RGBA), **channels** (R/G/B/A alphas), or **separate** (`p00/`, `p01/`, …) |
+| `qc/` | Preview MP4s (`*_matte_qc.mp4`, `*_normal_qc.mp4`, `*_review_qc.mp4`) — `qc_mp4: true` (default) |
 | `normal/` | Unit normal RGB EXR |
 | `_plate_jpeg_cache/` | Full-res JPEG plates for inference |
 | `_vis_matting/`, `_vis_normal/` | Side-by-side QC PNGs from upstream vis |

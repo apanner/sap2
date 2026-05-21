@@ -19,7 +19,11 @@ for p in (_SCRIPTS, str(_DENSE)):
 
 os.environ.setdefault("SAPIENS_CHECKPOINT_ROOT", str(_SAP2_ROOT / "checkpoints"))
 
-from exr_io import write_alpha_exr, write_normal_exr  # noqa: E402
+from exr_io import (  # noqa: E402
+    write_matte_exr,
+    write_matte_subject_channels_exr,
+    write_normal_exr,
+)
 from plate_cache import build_plate_jpeg_cache, cache_path, plate_cache_complete  # noqa: E402
 from sap2_infer import MODEL_NATIVE_H, MODEL_NATIVE_W, Sap2ShotProcessor  # noqa: E402
 
@@ -88,21 +92,41 @@ def process_shot(job: dict) -> bool:
         device=device,
         image_feed_mode=feed_mode,
         use_person_crop=bool(shared.get("use_person_crop", True)),
-        person_crop_pad=float(shared.get("person_crop_pad", 0.18)),
-        person_crop_confidence=float(shared.get("person_crop_confidence", 0.35)),
+        person_crop_pad=float(shared.get("person_crop_pad", 0.22)),
+        person_crop_confidence=float(shared.get("person_crop_confidence", 0.28)),
         person_crop_smooth=float(shared.get("person_crop_smooth", 0.72)),
         person_crop_multi=bool(shared.get("person_crop_multi", True)),
+        person_crop_mode=str(shared.get("person_crop_mode") or "union"),
+        matte_subject_layout=str(shared.get("matte_subject_layout") or "combined"),
+        matte_max_subjects=int(shared.get("matte_max_subjects", 4)),
     )
 
     try:
         if run_matting:
             matte_dir.mkdir(parents=True, exist_ok=True)
+            matte_layout = str(shared.get("matte_subject_layout") or "combined").strip().lower()
             for fi in range(frame_start, frame_end + 1):
-                exr_out = matte_dir / f"matte_{fi:06d}.exr"
-                if exr_out.is_file():
-                    continue
-                alpha = proc.process_frame_matting(cache_path(cache_dir, fi))
-                write_alpha_exr(exr_out, alpha)
+                if matte_layout == "combined":
+                    exr_out = matte_dir / f"matte_{fi:06d}.exr"
+                    if exr_out.is_file():
+                        continue
+                    matte = proc.process_frame_matting(cache_path(cache_dir, fi))
+                    write_matte_exr(exr_out, matte)
+                elif matte_layout == "channels":
+                    exr_out = matte_dir / f"matte_{fi:06d}.exr"
+                    if exr_out.is_file():
+                        continue
+                    subjects = proc.process_frame_matting_subjects(cache_path(cache_dir, fi))
+                    write_matte_subject_channels_exr(exr_out, subjects)
+                else:
+                    subjects = proc.process_frame_matting_subjects(cache_path(cache_dir, fi))
+                    for si, subj in enumerate(subjects):
+                        sub_dir = matte_dir / f"p{si:02d}"
+                        sub_dir.mkdir(parents=True, exist_ok=True)
+                        exr_out = sub_dir / f"matte_{fi:06d}.exr"
+                        if exr_out.is_file():
+                            continue
+                        write_matte_exr(exr_out, subj)
                 if (fi - frame_start) % 25 == 0:
                     _log.info("Matting %d/%d", fi - frame_start + 1, n_frames)
 

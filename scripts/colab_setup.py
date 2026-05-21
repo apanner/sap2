@@ -9,6 +9,7 @@ import sys
 
 PIP_PACKAGES = [
     "oiio-python>=2.5",
+    "imageio[ffmpeg]>=2.34",
     "opencv-python-headless",
     "safetensors",
     "accelerate",

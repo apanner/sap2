@@ -20,7 +20,11 @@ _DENSE = _SAP2_ROOT / "sapiens" / "dense"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from exr_io import write_alpha_exr, write_normal_exr  # noqa: E402
+from exr_io import (  # noqa: E402
+    write_matte_exr,
+    write_matte_subject_channels_exr,
+    write_normal_exr,
+)
 from plate_cache import build_plate_jpeg_cache, cache_path, plate_cache_complete, pattern_to_path  # noqa: E402
 
 _log = logging.getLogger("sap2_colab_run")
@@ -37,7 +41,8 @@ SAP2_DEFAULTS: dict[str, Any] = {
     "use_plate_jpeg_cache": True,
     "plate_jpeg_quality": 92,
     "plate_cache_workers": 12,
-    "qc_mp4": False,
+    "qc_mp4": True,
+    "qc_fps": 24.0,
     "batch_one_process_per_shot": True,
     "split_pass_subprocess": False,
     "image_feed_mode": "auto",
@@ -51,6 +56,9 @@ SAP2_DEFAULTS: dict[str, Any] = {
     "person_crop_confidence": 0.4,
     "person_crop_smooth": 0.72,
     "person_crop_multi": True,
+    "person_crop_mode": "union",
+    "matte_subject_layout": "combined",
+    "matte_max_subjects": 4,
 }
 
 from sap2_models import MODEL_CONFIGS  # noqa: E402
@@ -221,6 +229,7 @@ def _save_shot_to_drive(
         _copy_exr_folder_to_drive(local_shot / "matte", drive_shot / "matte", "matte")
     if export_normal:
         _copy_exr_folder_to_drive(local_shot / "normal", drive_shot / "normal", "normal")
+    _copy_qc_to_drive(local_shot, drive_shot)
 
 
 def _is_last_pass(pass_name: str, shared: dict[str, Any]) -> bool:
@@ -300,10 +309,13 @@ def _run_shot(
     proc_kw = dict(
         image_feed_mode=feed_mode,
         use_person_crop=bool(shared.get("use_person_crop", True)),
-        person_crop_pad=float(shared.get("person_crop_pad", 0.18)),
-        person_crop_confidence=float(shared.get("person_crop_confidence", 0.35)),
+        person_crop_pad=float(shared.get("person_crop_pad", 0.22)),
+        person_crop_confidence=float(shared.get("person_crop_confidence", 0.28)),
         person_crop_smooth=float(shared.get("person_crop_smooth", 0.72)),
         person_crop_multi=bool(shared.get("person_crop_multi", True)),
+        person_crop_mode=str(shared.get("person_crop_mode") or "union"),
+        matte_subject_layout=str(shared.get("matte_subject_layout") or "combined"),
+        matte_max_subjects=int(shared.get("matte_max_subjects", 4)),
     )
     device = "cuda:0"
     try:
@@ -341,14 +353,39 @@ def _run_shot(
                 raise FileNotFoundError(f"Missing matting ckpt: {ckpt}")
             matte_local.mkdir(parents=True, exist_ok=True)
             assert proc is not None
+            matte_layout = str(shared.get("matte_subject_layout") or "combined").strip().lower()
+            if matte_layout not in ("combined", "channels", "separate"):
+                matte_layout = "combined"
+            _log.info("Matte subject layout: %s", matte_layout)
             done = 0
             for fi in range(frame_start, frame_end + 1):
-                exr_out = matte_local / f"matte_{fi:06d}.exr"
-                if exr_out.is_file():
-                    done += 1
-                    continue
-                alpha = proc.process_frame_matting(cache_path(cache_dir, fi))
-                write_alpha_exr(exr_out, alpha)
+                if matte_layout == "combined":
+                    exr_out = matte_local / f"matte_{fi:06d}.exr"
+                    if exr_out.is_file():
+                        done += 1
+                        continue
+                    matte = proc.process_frame_matting(cache_path(cache_dir, fi))
+                    write_matte_exr(exr_out, matte)
+                elif matte_layout == "channels":
+                    exr_out = matte_local / f"matte_{fi:06d}.exr"
+                    if exr_out.is_file():
+                        done += 1
+                        continue
+                    subjects = proc.process_frame_matting_subjects(
+                        cache_path(cache_dir, fi)
+                    )
+                    write_matte_subject_channels_exr(exr_out, subjects)
+                else:
+                    subjects = proc.process_frame_matting_subjects(
+                        cache_path(cache_dir, fi)
+                    )
+                    for si, subj in enumerate(subjects):
+                        sub_dir = matte_local / f"p{si:02d}"
+                        sub_dir.mkdir(parents=True, exist_ok=True)
+                        exr_out = sub_dir / f"matte_{fi:06d}.exr"
+                        if exr_out.is_file():
+                            continue
+                        write_matte_exr(exr_out, subj)
                 done += 1
                 if done == 1 or done % 10 == 0 or done == n_frames:
                     _log.info("Matte → local %d/%d", done, n_frames)
@@ -382,6 +419,28 @@ def _run_shot(
         raise RuntimeError(f"Incomplete matte on local: {_exr_count(matte_local)}/{n_frames}")
     if export_normal and run_normal and _exr_count(normal_local) < n_frames:
         raise RuntimeError(f"Incomplete normal on local: {_exr_count(normal_local)}/{n_frames}")
+
+    if bool(shared.get("qc_mp4", True)):
+        try:
+            from sap2_qc_mp4 import export_sap2_qc_mp4s
+
+            fps = float(shared.get("qc_fps") or seq.get("fps") or shared.get("fps") or 24.0)
+            matte_layout = str(shared.get("matte_subject_layout") or "combined").strip().lower()
+            _log.info("%s: QC MP4 export (fps=%.3f, layout=%s)...", shot, fps, matte_layout)
+            written = export_sap2_qc_mp4s(
+                local_shot,
+                plate_cache_dir=cache_dir if cache_dir.is_dir() else None,
+                frame_start=frame_start,
+                frame_end=frame_end,
+                fps=fps,
+                matte_subject_layout=matte_layout,
+                export_matte=export_matte and run_matting,
+                export_normal=export_normal and run_normal,
+            )
+            if not written:
+                _log.warning("%s: QC MP4 — no previews written (missing EXR?)", shot)
+        except Exception as exc:
+            _log.warning("QC MP4 export failed for %s: %s", shot, exc)
 
     if save_to_drive:
         _log.info("[SAVE] Copying %s → Drive...", shot)
