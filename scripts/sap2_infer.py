@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""Sapiens2 matting + normals — native 1024×768; optional person-crop infer."""
+"""
+Sapiens2 infer — official image path ([facebookresearch/sapiens2](https://github.com/facebookresearch/sapiens2)):
+
+  Full-res BGR plate → pipeline resize 1024×768 → model → upsample to full plate → EXR
+
+4K plates: ``image_feed_mode=auto`` uses person-crop so the model budget targets humans.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +13,7 @@ import gc
 import logging
 import sys
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Literal
 
 import cv2
 import numpy as np
@@ -16,24 +22,43 @@ import torch.nn.functional as F
 
 _log = logging.getLogger("sap2_infer")
 
+# All standard dense configs: image_size = (1024, 768) H×W
 MODEL_NATIVE_H = 1024
 MODEL_NATIVE_W = 768
 
+ImageFeedMode = Literal["auto", "full_res", "person_crop"]
 
-def patch_pipeline_size(model: Any, height: int, width: int) -> None:
-    if int(height) != MODEL_NATIVE_H or int(width) != MODEL_NATIVE_W:
-        _log.warning(
-            "Ignoring pipeline resize %d×%d — model capacity is %d×%d only",
-            height,
-            width,
-            MODEL_NATIVE_H,
-            MODEL_NATIVE_W,
-        )
-        return
+# Above this megapixel count, auto mode prefers person crop (4K ≈ 8.3 MP)
+_AUTO_CROP_MIN_MP = 1.05
+_AUTO_CROP_MIN_LONG_EDGE = 1920
+
+
+def resolve_use_person_crop(
+    plate_h: int,
+    plate_w: int,
+    *,
+    image_feed_mode: ImageFeedMode = "auto",
+    use_person_crop_flag: bool = True,
+) -> bool:
+    if not use_person_crop_flag:
+        return False
+    if image_feed_mode == "full_res":
+        return False
+    if image_feed_mode == "person_crop":
+        return True
+    mp = plate_h * plate_w / 1_000_000.0
+    long_edge = max(plate_h, plate_w)
+    return mp >= _AUTO_CROP_MIN_MP or long_edge >= _AUTO_CROP_MIN_LONG_EDGE
+
+
+def patch_pipeline_native(model: Any) -> None:
+    """Ensure test pipeline stays at model-native 1024×768 (do not upscale)."""
     for t in getattr(model.pipeline, "transforms", []):
         if hasattr(t, "height") and hasattr(t, "width"):
-            t.height = int(height)
-            t.width = int(width)
+            t.height = MODEL_NATIVE_H
+            t.width = MODEL_NATIVE_W
+        if type(t).__name__ == "MattingResize":
+            t.keep_ratio = False  # official matting test: stretch to 1024×768
 
 
 def _init_task_model(
@@ -41,6 +66,8 @@ def _init_task_model(
     config_rel: str,
     ckpt: Path,
     device: str,
+    *,
+    is_matting: bool,
 ) -> Any:
     import os
 
@@ -54,33 +81,46 @@ def _init_task_model(
 
         model = init_model(str(config_rel), str(ckpt), device=device)
         model.float()
-        patch_pipeline_size(model, MODEL_NATIVE_H, MODEL_NATIVE_W)
+        model.eval()
+        patch_pipeline_native(model)
         return model
     finally:
         os.chdir(prev)
 
 
-def _run_matting_frame(model: Any, image_bgr: np.ndarray, device: str) -> np.ndarray:
+def _cuda_sync_cleanup() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def _run_matting_on_bgr(model: Any, image_bgr: np.ndarray) -> np.ndarray:
+    """Official vis_matting path: any resolution in → full resolution alpha out."""
+    out_h, out_w = image_bgr.shape[:2]
     data = model.pipeline(dict(img=image_bgr))
     data = model.data_preprocessor(data)
-    with torch.inference_mode():
-        out = model(data["inputs"])
+    inputs = data["inputs"]
+    with torch.no_grad():
+        out = model(inputs)
     out = F.interpolate(
         out.float(),
-        size=(image_bgr.shape[0], image_bgr.shape[1]),
+        size=(out_h, out_w),
         mode="bilinear",
         align_corners=False,
     )
     alpha = out.squeeze(0)[3].float().cpu().numpy().clip(0.0, 1.0)
-    return alpha
+    del data, inputs, out
+    return np.ascontiguousarray(alpha, dtype=np.float32)
 
 
-def _run_normal_frame(model: Any, image_bgr: np.ndarray, device: str) -> np.ndarray:
+def _run_normal_on_bgr(model: Any, image_bgr: np.ndarray) -> np.ndarray:
+    out_h, out_w = image_bgr.shape[:2]
     data = model.pipeline(dict(img=image_bgr))
     data = model.data_preprocessor(data)
     inputs = data["inputs"]
     samples = data.get("data_samples")
-    with torch.inference_mode():
+    with torch.no_grad():
         normal = model(inputs)
         normal = normal / torch.norm(normal, dim=1, keepdim=True).clamp(min=1e-8)
     if samples and "meta" in samples and "padding_size" in samples["meta"]:
@@ -93,16 +133,21 @@ def _run_normal_frame(model: Any, image_bgr: np.ndarray, device: str) -> np.ndar
         ]
     normal = F.interpolate(
         normal.float(),
-        size=(image_bgr.shape[0], image_bgr.shape[1]),
+        size=(out_h, out_w),
         mode="bilinear",
         align_corners=False,
     )
     out = normal.squeeze(0).cpu().numpy().transpose(1, 2, 0)
-    return np.ascontiguousarray(out.astype(np.float32, copy=True))
+    del data, inputs, normal
+    return np.ascontiguousarray(out.astype(np.float32))
 
 
 class Sap2ShotProcessor:
-    """Full-res plates → person crop (optional) → 1024×768 infer → full-res EXR."""
+    """
+    4K (or any size) JPEG/PNG plates:
+      - full_res: entire frame → Sapiens2 pipeline → full-res EXR
+      - person_crop / auto: detect human → crop → pipeline → paste → full-res EXR
+    """
 
     def __init__(
         self,
@@ -110,12 +155,11 @@ class Sap2ShotProcessor:
         ckpt_root: Path,
         model_key: str = "1b",
         device: str = "cuda:0",
-        inference_long_edge: int = 0,
-        max_megapixels: float = 0.0,
         *,
+        image_feed_mode: ImageFeedMode = "auto",
         use_person_crop: bool = True,
         person_crop_pad: float = 0.18,
-        person_crop_confidence: float = 0.4,
+        person_crop_confidence: float = 0.35,
         person_crop_smooth: float = 0.72,
         person_crop_multi: bool = True,
     ):
@@ -123,103 +167,144 @@ class Sap2ShotProcessor:
         self.ckpt_root = Path(ckpt_root)
         self.model_key = model_key.replace("sapiens2_", "")
         self.device = device
-        self.use_person_crop = bool(use_person_crop)
-        if int(inference_long_edge) > 0 or float(max_megapixels or 0) > 0:
-            _log.info("infer size overrides ignored — model native %d×%d", MODEL_NATIVE_H, MODEL_NATIVE_W)
+        self.image_feed_mode: ImageFeedMode = image_feed_mode  # type: ignore[assignment]
+        self.use_person_crop_flag = bool(use_person_crop)
+        self._person_crop_pad = person_crop_pad
+        self._person_crop_confidence = person_crop_confidence
+        self._person_crop_smooth = person_crop_smooth
+        self._person_crop_multi = person_crop_multi
         self._matting_model = None
         self._normal_model = None
         self._crop_tracker = None
+        self._plate_logged = False
 
         from sap2_models import MODEL_CONFIGS
 
         self._cfg = MODEL_CONFIGS.get(self.model_key, MODEL_CONFIGS["1b"])
-        if self.use_person_crop:
+
+    def _crop_tracker_lazy(self) -> Any:
+        if self._crop_tracker is None:
             from person_detect import PersonCropTracker
 
             self._crop_tracker = PersonCropTracker(
-                pad_ratio=person_crop_pad,
-                min_confidence=person_crop_confidence,
-                smooth_alpha=person_crop_smooth,
-                merge_multi=person_crop_multi,
+                pad_ratio=self._person_crop_pad,
+                min_confidence=self._person_crop_confidence,
+                smooth_alpha=self._person_crop_smooth,
+                merge_multi=self._person_crop_multi,
             )
-            _log.info(
-                "Person-crop infer ON (pad=%.0f%%, conf=%.2f, multi=%s)",
-                person_crop_pad * 100,
-                person_crop_confidence,
-                person_crop_multi,
-            )
+        return self._crop_tracker
 
-    def _log_infer_mode(self, label: str, plate_h: int, plate_w: int) -> None:
-        mode = "person crop → 1024×768" if self.use_person_crop else "full frame → 1024×768"
-        _log.info("%s: plate %d×%d — %s → EXR full res", label, plate_h, plate_w, mode)
+    def _log_plate_once(self, h: int, w: int, use_crop: bool) -> None:
+        if self._plate_logged:
+            return
+        self._plate_logged = True
+        mp = h * w / 1e6
+        mode = "person crop" if use_crop else "full frame (official)"
+        _log.info(
+            "4K/plate feed: %d×%d (%.2f MP) — %s → model %d×%d → EXR %d×%d",
+            w,
+            h,
+            mp,
+            mode,
+            MODEL_NATIVE_W,
+            MODEL_NATIVE_H,
+            w,
+            h,
+        )
 
-    def _ensure_matting(self, plate_h: int, plate_w: int) -> None:
+    def _read_bgr(self, jpeg_path: Path) -> np.ndarray:
+        img = cv2.imread(str(jpeg_path), cv2.IMREAD_COLOR)
+        if img is None:
+            raise FileNotFoundError(jpeg_path)
+        return img
+
+    def _ensure_matting(self) -> None:
         if self._matting_model is not None:
             return
-        self._log_infer_mode("Matting", plate_h, plate_w)
         ckpt = self.ckpt_root / self._cfg["matting_ckpt"]
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if not ckpt.is_file():
+            raise FileNotFoundError(f"Missing matting ckpt: {ckpt}")
+        _cuda_sync_cleanup()
         self._matting_model = _init_task_model(
             self.dense_root,
             self._cfg["matting_config"],
             ckpt,
             self.device,
+            is_matting=True,
         )
+        _log.info("Matting model ready (native %d×%d internal)", MODEL_NATIVE_H, MODEL_NATIVE_W)
 
-    def _ensure_normal(self, plate_h: int, plate_w: int) -> None:
+    def _ensure_normal(self) -> None:
         if self._normal_model is not None:
             return
-        self._log_infer_mode("Normal", plate_h, plate_w)
         ckpt = self.ckpt_root / self._cfg["normal_ckpt"]
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if not ckpt.is_file():
+            raise FileNotFoundError(f"Missing normal ckpt: {ckpt}")
+        _cuda_sync_cleanup()
         self._normal_model = _init_task_model(
             self.dense_root,
             self._cfg["normal_config"],
             ckpt,
             self.device,
+            is_matting=False,
         )
+        _log.info("Normal model ready (native %d×%d + letterbox pad)", MODEL_NATIVE_H, MODEL_NATIVE_W)
 
-    def _infer_matting_crops(self, crops: List[np.ndarray]) -> List[np.ndarray]:
+    def _process_matting_bgr(self, img: np.ndarray) -> np.ndarray:
+        h, w = img.shape[:2]
+        use_crop = resolve_use_person_crop(
+            h, w,
+            image_feed_mode=self.image_feed_mode,
+            use_person_crop_flag=self.use_person_crop_flag,
+        )
+        self._log_plate_once(h, w, use_crop)
+        self._ensure_matting()
         assert self._matting_model is not None
-        return [_run_matting_frame(self._matting_model, c, self.device) for c in crops]
 
-    def _infer_normal_crops(self, crops: List[np.ndarray]) -> List[np.ndarray]:
+        if not use_crop:
+            return _run_matting_on_bgr(self._matting_model, img)
+
+        tracker = self._crop_tracker_lazy()
+        crops, boxes, _ = tracker.crop_regions(img)
+        mattes = [_run_matting_on_bgr(self._matting_model, c) for c in crops]
+        if len(mattes) == 1:
+            return tracker.paste_matte(h, w, mattes[0], boxes[0])
+        return tracker.merge_mattes(h, w, mattes, boxes)
+
+    def _process_normal_bgr(self, img: np.ndarray) -> np.ndarray:
+        h, w = img.shape[:2]
+        use_crop = resolve_use_person_crop(
+            h, w,
+            image_feed_mode=self.image_feed_mode,
+            use_person_crop_flag=self.use_person_crop_flag,
+        )
+        self._log_plate_once(h, w, use_crop)
+        self._ensure_normal()
         assert self._normal_model is not None
-        return [_run_normal_frame(self._normal_model, c, self.device) for c in crops]
+
+        if not use_crop:
+            return _run_normal_on_bgr(self._normal_model, img)
+
+        tracker = self._crop_tracker_lazy()
+        crops, boxes, _ = tracker.crop_regions(img)
+        normals = [_run_normal_on_bgr(self._normal_model, c) for c in crops]
+        if len(normals) == 1:
+            return tracker.paste_normal(h, w, normals[0], boxes[0])
+        return tracker.merge_normals(h, w, normals, boxes)
 
     def process_frame_matting(self, jpeg_path: Path) -> np.ndarray:
-        img = cv2.imread(str(jpeg_path))
-        if img is None:
-            raise FileNotFoundError(jpeg_path)
-        h, w = img.shape[:2]
-        self._ensure_matting(h, w)
-
-        if not self.use_person_crop or self._crop_tracker is None:
-            return _run_matting_frame(self._matting_model, img, self.device)
-
-        crops, boxes, _full = self._crop_tracker.crop_regions(img)
-        mattes = self._infer_matting_crops(crops)
-        if len(mattes) == 1:
-            return self._crop_tracker.paste_matte(h, w, mattes[0], boxes[0])
-        return self._crop_tracker.merge_mattes(h, w, mattes, boxes)
+        img = self._read_bgr(jpeg_path)
+        try:
+            return self._process_matting_bgr(img)
+        finally:
+            _cuda_sync_cleanup()
 
     def process_frame_normal(self, jpeg_path: Path) -> np.ndarray:
-        img = cv2.imread(str(jpeg_path))
-        if img is None:
-            raise FileNotFoundError(jpeg_path)
-        h, w = img.shape[:2]
-        self._ensure_normal(h, w)
-
-        if not self.use_person_crop or self._crop_tracker is None:
-            return _run_normal_frame(self._normal_model, img, self.device)
-
-        crops, boxes, _full = self._crop_tracker.crop_regions(img)
-        normals = self._infer_normal_crops(crops)
-        if len(normals) == 1:
-            return self._crop_tracker.paste_normal(h, w, normals[0], boxes[0])
-        return self._crop_tracker.merge_normals(h, w, normals, boxes)
+        img = self._read_bgr(jpeg_path)
+        try:
+            return self._process_normal_bgr(img)
+        finally:
+            _cuda_sync_cleanup()
 
     def unload(self) -> None:
         for attr in ("_matting_model", "_normal_model"):
@@ -228,7 +313,4 @@ class Sap2ShotProcessor:
                 del m
             setattr(self, attr, None)
         self._crop_tracker = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        _cuda_sync_cleanup()

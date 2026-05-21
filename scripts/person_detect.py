@@ -109,11 +109,23 @@ class PersonDetector:
     def _detect_dnn(self, image_bgr: np.ndarray) -> List[BBox]:
         assert self._net is not None
         h, w = image_bgr.shape[:2]
+        det_long = 1280
+        scale = 1.0
+        det_img = image_bgr
+        if max(h, w) > det_long:
+            scale = det_long / max(h, w)
+            det_img = cv2.resize(
+                image_bgr,
+                (int(w * scale), int(h * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+        dh, dw = det_img.shape[:2]
         blob = cv2.dnn.blobFromImage(
-            image_bgr, scalefactor=0.007843, size=(300, 300), mean=127.5
+            det_img, scalefactor=0.007843, size=(300, 300), mean=127.5
         )
         self._net.setInput(blob)
         det = self._net.forward()
+        inv = 1.0 / scale
         boxes: List[BBox] = []
         for i in range(det.shape[2]):
             conf = float(det[0, 0, i, 2])
@@ -122,25 +134,42 @@ class PersonDetector:
             class_id = int(det[0, 0, i, 1])
             if class_id != PERSON_CLASS_ID_MOBILENET:
                 continue
-            x1 = int(det[0, 0, i, 3] * w)
-            y1 = int(det[0, 0, i, 4] * h)
-            x2 = int(det[0, 0, i, 5] * w)
-            y2 = int(det[0, 0, i, 6] * h)
+            x1 = int(det[0, 0, i, 3] * dw * inv)
+            y1 = int(det[0, 0, i, 4] * dh * inv)
+            x2 = int(det[0, 0, i, 5] * dw * inv)
+            y2 = int(det[0, 0, i, 6] * dh * inv)
             if x2 > x1 + 8 and y2 > y1 + 8:
-                boxes.append(BBox(x1, y1, x2, y2))
+                boxes.append(BBox(x1, y1, x2, y2).clamp(w, h))
         return boxes
 
     def _detect_hog(self, image_bgr: np.ndarray) -> List[BBox]:
         h, w = image_bgr.shape[:2]
+        det_img = image_bgr
+        scale = 1.0
+        if max(h, w) > 1280:
+            scale = 1280 / max(h, w)
+            det_img = cv2.resize(
+                image_bgr,
+                (int(w * scale), int(h * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
         rects, _weights = self._hog.detectMultiScale(
-            image_bgr,
+            det_img,
             winStride=(8, 8),
             padding=(16, 16),
             scale=1.05,
         )
+        inv = 1.0 / scale
         boxes: List[BBox] = []
         for x, y, bw, bh in rects:
-            boxes.append(BBox(int(x), int(y), int(x + bw), int(y + bh)).clamp(w, h))
+            boxes.append(
+                BBox(
+                    int(x * inv),
+                    int(y * inv),
+                    int((x + bw) * inv),
+                    int((y + bh) * inv),
+                ).clamp(w, h)
+            )
         return boxes
 
 

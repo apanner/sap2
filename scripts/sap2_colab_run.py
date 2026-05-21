@@ -39,7 +39,8 @@ SAP2_DEFAULTS: dict[str, Any] = {
     "plate_cache_workers": 12,
     "qc_mp4": False,
     "batch_one_process_per_shot": True,
-    "split_pass_subprocess": True,
+    "split_pass_subprocess": False,
+    "image_feed_mode": "auto",
     "batch_gap_seconds": 5,
     "checkpoint_root": "",
     "download_models_in_colab": True,
@@ -293,12 +294,14 @@ def _run_shot(
         else:
             _log.info("JPEG cache ready: %s", cache_dir)
 
-    long_edge = int(shared.get("inference_long_edge", 0))
-    max_mp = float(shared.get("inference_max_megapixels", 0))
+    feed_mode = str(shared.get("image_feed_mode") or "auto").strip().lower()
+    if feed_mode not in ("auto", "full_res", "person_crop"):
+        feed_mode = "auto"
     proc_kw = dict(
+        image_feed_mode=feed_mode,
         use_person_crop=bool(shared.get("use_person_crop", True)),
         person_crop_pad=float(shared.get("person_crop_pad", 0.18)),
-        person_crop_confidence=float(shared.get("person_crop_confidence", 0.4)),
+        person_crop_confidence=float(shared.get("person_crop_confidence", 0.35)),
         person_crop_smooth=float(shared.get("person_crop_smooth", 0.72)),
         person_crop_multi=bool(shared.get("person_crop_multi", True)),
     )
@@ -318,22 +321,26 @@ def _run_shot(
     from sap2_infer import MODEL_NATIVE_H, MODEL_NATIVE_W, Sap2ShotProcessor
 
     _log.info(
-        "Infer locked to model native %d×%d (plate EXR stays full res)",
+        "Sapiens2: full-res plate → %d×%d infer → full-res EXR (feed=%s)",
         MODEL_NATIVE_H,
         MODEL_NATIVE_W,
+        feed_mode,
     )
 
-    if run_matting and not matte_done:
-        ckpt = ckpt_root / cfg["matting_ckpt"]
-        if not ckpt.is_file():
-            raise FileNotFoundError(f"Missing matting ckpt: {ckpt}")
-        matte_local.mkdir(parents=True, exist_ok=True)
+    need_proc = (run_matting and not matte_done) or (run_normal and not normal_done)
+    proc: Sap2ShotProcessor | None = None
+    if need_proc:
         proc = Sap2ShotProcessor(
-            _DENSE, ckpt_root, model_key=model_key, device=device,
-            inference_long_edge=long_edge, max_megapixels=max_mp,
-            **proc_kw,
+            _DENSE, ckpt_root, model_key=model_key, device=device, **proc_kw
         )
-        try:
+
+    try:
+        if run_matting and not matte_done:
+            ckpt = ckpt_root / cfg["matting_ckpt"]
+            if not ckpt.is_file():
+                raise FileNotFoundError(f"Missing matting ckpt: {ckpt}")
+            matte_local.mkdir(parents=True, exist_ok=True)
+            assert proc is not None
             done = 0
             for fi in range(frame_start, frame_end + 1):
                 exr_out = matte_local / f"matte_{fi:06d}.exr"
@@ -345,21 +352,15 @@ def _run_shot(
                 done += 1
                 if done == 1 or done % 10 == 0 or done == n_frames:
                     _log.info("Matte → local %d/%d", done, n_frames)
-        finally:
-            proc.unload()
-    elif run_matting:
-        _log.info("Skip matting (local=%d drive=%d)", _exr_count(matte_local), _exr_count(matte_drive))
+        elif run_matting:
+            _log.info("Skip matting (local=%d drive=%d)", _exr_count(matte_local), _exr_count(matte_drive))
 
-    if run_normal and not normal_done:
-        ckpt = ckpt_root / cfg["normal_ckpt"]
-        if not ckpt.is_file():
-            raise FileNotFoundError(f"Missing normal ckpt: {ckpt}")
-        normal_local.mkdir(parents=True, exist_ok=True)
-        proc = Sap2ShotProcessor(
-            _DENSE, ckpt_root, model_key=model_key, device=device,
-            inference_long_edge=long_edge, max_megapixels=max_mp,
-        )
-        try:
+        if run_normal and not normal_done:
+            ckpt = ckpt_root / cfg["normal_ckpt"]
+            if not ckpt.is_file():
+                raise FileNotFoundError(f"Missing normal ckpt: {ckpt}")
+            normal_local.mkdir(parents=True, exist_ok=True)
+            assert proc is not None
             done = 0
             for fi in range(frame_start, frame_end + 1):
                 exr_out = normal_local / f"normal_{fi:06d}.exr"
@@ -371,10 +372,11 @@ def _run_shot(
                 done += 1
                 if done == 1 or done % 10 == 0 or done == n_frames:
                     _log.info("Normal → local %d/%d", done, n_frames)
-        finally:
+        elif run_normal:
+            _log.info("Skip normal (local=%d drive=%d)", _exr_count(normal_local), _exr_count(normal_drive))
+    finally:
+        if proc is not None:
             proc.unload()
-    elif run_normal:
-        _log.info("Skip normal (local=%d drive=%d)", _exr_count(normal_local), _exr_count(normal_drive))
 
     if export_matte and run_matting and _exr_count(matte_local) < n_frames:
         raise RuntimeError(f"Incomplete matte on local: {_exr_count(matte_local)}/{n_frames}")

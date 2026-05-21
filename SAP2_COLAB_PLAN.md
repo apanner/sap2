@@ -10,10 +10,27 @@
 | **Matte** | SAM3 track → BiRefNet / ViTMatte refine | Single **human matting** head (`sapiens2_1b_matting`) |
 | **Normals** | — | **Surface normals** (`sapiens2_*_normal`) |
 | **Input** | Any foreground (text prompts) | **Human-centric** (people in frame) |
-| **Native infer res** | Full-res refine optional | **1024×768 (H×W)** on person crop (OpenCV detect) or full frame; EXR at plate size |
+| **Native infer res** | Full-res refine optional | **1024×768 (H×W)** internal; **EXR at full plate size** |
 | **Python / torch** | 3.10+, torch 2.x | **≥3.12**, **torch ≥2.7** |
 
-Use SAP2 when plates are **people / live-action humans** and you want **matte + normal** without SAM3/BiRefNet. Keep LAOV matte for multi-object / non-human plates.
+## Image data (official Sapiens2 + SAP2 4K)
+
+Per [facebookresearch/sapiens2](https://github.com/facebookresearch/sapiens2):
+
+- Models are trained at **1024×768 (H×W)** (not plate resolution).
+- Inference accepts **any-size** JPG/PNG/EXR→JPEG: `cv2.imread` → `model.pipeline` resizes → model → **bilinear upsample to original H×W**.
+- **Matting:** stretch to 1024×768 (`keep_ratio=False`).
+- **Normals:** letterbox + pad to 1024×768, then unpad.
+
+### SAP2 feed modes for 4K plates (e.g. 2160×3840)
+
+| `image_feed_mode` | Behavior |
+|-------------------|----------|
+| **`auto`** (default) | **≥1080p / >1 MP** → OpenCV person detect → crop → infer → paste to **full 4K EXR** |
+| **`full_res`** | Whole 4K frame → official pipeline (stretch to 1024×768) → **full 4K EXR** |
+| **`person_crop`** | Always detect + crop (best matte detail on wide shots) |
+
+You always get **full-resolution EXR** on disk; only the **internal** infer uses 1024×768.
 
 ## I/O layout (VDA-style — same as depth lane)
 
@@ -24,7 +41,7 @@ Use SAP2 when plates are **people / live-action humans** and you want **matte + 
 | **Models** | Colab local: `/content/sapiens2_checkpoints` (Cell 3 download) |
 | **Deliverables (save)** | Drive: `MyDrive/VDA_output/{YYYYMMDD}/SAP2_output/{shot}/matte|normal/` |
 
-Resume checks **Drive** EXR counts; infer missing frames to **local** only; `shutil.copy2` to Drive **once when shot is done** (VDA `[SAVE]` block).
+Resume checks **Drive** EXR counts; infer missing frames locally; `shutil.copy2` to Drive **once when shot is done**.
 
 ```
 /content/output/{shot}/               # ephemeral — same as VDA LOCAL_OUTPUT_PATH
@@ -49,94 +66,36 @@ Desk / manual JSON (same shape as LAOV batch):
     "sapiens_model": "1b",
     "run_matting": true,
     "run_normal": true,
-    "export_matte_exr": true,
-    "export_normal_exr": true,
-    "use_plate_jpeg_cache": true,
-    "plate_jpeg_quality": 92,
-    "plate_cache_workers": 8,
-    "qc_mp4": true,
-    "batch_one_process_per_shot": true,
-    "batch_gap_seconds": 5,
-    "checkpoint_root": "/content/drive/MyDrive/VDA_models/sapiens2_host"
+    "image_feed_mode": "auto",
+    "use_person_crop": true,
+    "person_crop_pad": 0.18,
+    "output_folder_path": "/content/drive/MyDrive/VDA_output"
   },
   "sequences": [
     {
-      "shot_name": "TB_073_050",
+      "shot_name": "073_020",
       "plate_dir": "/content/drive/MyDrive/plates/TB_073_050",
-      "plate_pattern": "TB_073_050.%04d.exr",
+      "plate_pattern": "TB_073_050_plate_v001_%06d.exr",
       "frame_start": 1001,
-      "frame_end": 1100
+      "frame_end": 1050
     }
   ]
 }
 ```
 
-## Colab cells (3-cell pattern)
+## Colab cells
 
 | Cell | Action |
 |------|--------|
 | **1** | Mount Drive, auth |
-| **2** | Download config from Drive file id; set `SAP2_DRIVE_MOUNT`, date folder |
-| **3** | Clone `apanner/sap2`, `pip install -e .`, `colab_setup.py`, run `sap2_colab_run.py` |
+| **2** | Download config from Drive file id; set `SAP2_LOCAL_OUTPUT=/content/output` |
+| **3** | `git pull` sap2 → `colab_setup.py` → `sap2_colab_run.py` (one process per shot: matting + normal) |
 
-Templates: `colab_templates/sap2_cellcode_template.py`, `sap2_notebook_minimal_template.py`.
+## Models (Colab local, not Drive)
 
-## Runner phases (`scripts/sap2_colab_run.py`)
+Cell 3 downloads to `/content/sapiens2_checkpoints`:
 
-1. **Plate cache** — parallel EXR→JPEG (OpenImageIO); skip if cache complete.
-2. **Matting** — `vis_matting.py` → `_alpha.npy` per frame → **EXR** in `matte/`.
-3. **Normals** — `vis_normal.py` → `.npy` → **EXR** in `normal/` (unit vectors, -1 outside optional later).
-4. **Resume** — skip pass if output EXR count ≥ frame count.
-5. **Batch** — optional one subprocess per shot (VRAM reset), continue on failure.
-6. **QC** — optional MP4 (plate | alpha | normal false-color).
+- `matting/sapiens2_1b_matting.safetensors`
+- `normal/sapiens2_1b_normal.safetensors`
 
-## Models (one-time on Drive)
-
-From [docs/MODEL_ZOO.md](docs/MODEL_ZOO.md):
-
-| Task | HuggingFace | Local path under `sapiens2_host/` |
-|------|-------------|-----------------------------------|
-| Matting | [facebook/sapiens2-matting-1b](https://huggingface.co/facebook/sapiens2-matting-1b) | `matting/sapiens2_1b_matting.safetensors` |
-| Normal 1B | [facebook/sapiens2-normal-1b](https://huggingface.co/facebook/sapiens2-normal-1b) | `normal/sapiens2_1b_normal.safetensors` |
-
-`scripts/download_checkpoints_colab.py` can pull HF weights into Drive (run once in Cell 2 or a setup notebook).
-
-## Desk integration (phase 2)
-
-- New lane `SAP2_STANDALONE` in `google_desk_app` (mirror `ai_matte_config_generator.py`).
-- Upload cellcode + JSON to `VDA_Jobs/`.
-- Nuke read nodes: `matte/*.exr`, `normal/*.exr` under `SAP2_output/{date}/{shot}/`.
-
-## Risks / constraints
-
-1. **Colab Python** — must be **3.12+**; use Runtime → change runtime or `!python --version` before install.
-2. **torch 2.7** — first run may reinstall torch (long Cell 3).
-3. **4K plates** — inference still 1024×768; output upsampled to full plate (same as upstream demos).
-4. **Normals without seg mask** — full-frame normal; optional `seg_dir` later for body-only export.
-5. **License** — Sapiens2 proprietary license; checkpoints from Meta HF.
-
-## Implementation status
-
-| Item | Status |
-|------|--------|
-| Plan (this doc) | ✅ |
-| `sap2_colab_run.py` + high-res `sap2_infer.py` | ✅ |
-| `deploy/external_engine/sap2_engine.py` | ✅ local VDA-style engine |
-| `launch_sap2_engine.bat` | ✅ |
-| `batch/launch_sap2_batch.bat` + GUI | ✅ |
-| `run_app_sap2.bat` + Desk settings | ✅ |
-| `sap2_config_generator.py` | ✅ |
-| Cellcode + notebook template | ✅ |
-| `COLAB.md` quick start | ✅ |
-| Git push `push_to_github.bat` | ✅ |
-
-## Citation
-
-```bibtex
-@article{khirodkarsapiens2,
-  title={Sapiens2},
-  author={Khirodkar, Rawal and Wen, He and Martinez, Julieta and Dong, Yuan and Su, Zhaoen and Saito, Shunsuke},
-  journal={arXiv preprint arXiv:2604.21681},
-  year={2026}
-}
-```
+Person detector weights: `/content/sap2_models/person_det/` (MobileNet-SSD, auto-download).

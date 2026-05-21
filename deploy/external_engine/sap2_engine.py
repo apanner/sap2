@@ -53,7 +53,9 @@ def process_shot(job: dict) -> bool:
         or os.environ.get("SAPIENS_CHECKPOINT_ROOT", _SAP2_ROOT / "checkpoints")
     )
     model_key = str(shared.get("sapiens_model", "1b"))
-    long_edge = int(shared.get("inference_long_edge", 0))
+    feed_mode = str(shared.get("image_feed_mode") or "auto").strip().lower()
+    if feed_mode not in ("auto", "full_res", "person_crop"):
+        feed_mode = "auto"
     run_matting = bool(shared.get("run_matting", True))
     run_normal = bool(shared.get("run_normal", True))
 
@@ -64,7 +66,7 @@ def process_shot(job: dict) -> bool:
     n_frames = frame_end - frame_start + 1
 
     _log.info("SAP2 shot=%s frames %d-%d → %s", shot, frame_start, frame_end, out_shot)
-    _log.info("Infer %d×%d native (long_edge setting %s ignored)", MODEL_NATIVE_H, MODEL_NATIVE_W, long_edge or "0")
+    _log.info("Infer %d×%d native, image_feed_mode=%s", MODEL_NATIVE_H, MODEL_NATIVE_W, feed_mode)
 
     if bool(shared.get("use_plate_jpeg_cache", True)):
         if not plate_cache_complete(cache_dir, frame_start, frame_end):
@@ -84,10 +86,10 @@ def process_shot(job: dict) -> bool:
         ckpt_root,
         model_key=model_key,
         device=device,
-        inference_long_edge=long_edge,
+        image_feed_mode=feed_mode,
         use_person_crop=bool(shared.get("use_person_crop", True)),
         person_crop_pad=float(shared.get("person_crop_pad", 0.18)),
-        person_crop_confidence=float(shared.get("person_crop_confidence", 0.4)),
+        person_crop_confidence=float(shared.get("person_crop_confidence", 0.35)),
         person_crop_smooth=float(shared.get("person_crop_smooth", 0.72)),
         person_crop_multi=bool(shared.get("person_crop_multi", True)),
     )
