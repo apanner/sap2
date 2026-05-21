@@ -430,7 +430,10 @@ def _run_batch(job_path: Path, shot_index: int | None, pass_name: str) -> int:
     if bool(shared.get("use_person_crop", True)):
         from person_detect import ensure_person_det_weights
 
-        ensure_person_det_weights()
+        try:
+            ensure_person_det_weights()
+        except Exception as exc:
+            _log.warning("Person detector download skipped (%s) — HOG fallback", exc)
     os.environ["SAPIENS_CHECKPOINT_ROOT"] = str(ckpt_root)
 
     _log.info("Local output (VDA): %s", _local_output_root().resolve())

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,12 +20,14 @@ PERSON_CLASS_ID_MOBILENET = 15
 DNN_DIR = Path(os.environ.get("SAP2_PERSON_DET_DIR", "/content/sap2_models/person_det"))
 PROTOTXT_NAME = "MobileNetSSD_deploy.prototxt"
 CAFFEMODEL_NAME = "MobileNetSSD_deploy.caffemodel"
-PROTOTXT_URL = (
-    "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/MobileNetSSD_deploy.prototxt"
+
+# chuanqi305 raw master URLs 404; use mirrors that still host the VOC deploy files
+PROTOTXT_URLS = (
+    "https://raw.githubusercontent.com/djmv/MobilNet_SSD_opencv/master/MobileNetSSD_deploy.prototxt",
+    "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/voc/MobileNetSSD_deploy.prototxt",
 )
-CAFFEMODEL_URL = (
-    "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/"
-    "master/MobileNetSSD_deploy.caffemodel"
+CAFFEMODEL_URLS = (
+    "https://raw.githubusercontent.com/djmv/MobilNet_SSD_opencv/master/MobileNetSSD_deploy.caffemodel",
 )
 
 
@@ -57,18 +60,46 @@ class BBox:
         return slice(self.y1, self.y2), slice(self.x1, self.x2)
 
 
-def _download_file(url: str, dest: Path) -> None:
+def _download_file(url: str, dest: Path, *, min_bytes: int = 1) -> bool:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.is_file() and dest.stat().st_size > 100_000:
-        return
-    _log.info("Downloading %s → %s", url, dest)
-    urllib.request.urlretrieve(url, dest)
+    if dest.is_file() and dest.stat().st_size >= min_bytes:
+        return True
+    _log.info("Downloading %s", url)
+    try:
+        urllib.request.urlretrieve(url, dest)
+    except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+        _log.warning("Download failed %s: %s", url, exc)
+        if dest.is_file():
+            dest.unlink(missing_ok=True)
+        return False
+    ok = dest.is_file() and dest.stat().st_size >= min_bytes
+    if not ok and dest.is_file():
+        dest.unlink(missing_ok=True)
+    return ok
+
+
+def _download_first(urls: tuple[str, ...], dest: Path, *, min_bytes: int) -> bool:
+    if dest.is_file() and dest.stat().st_size >= min_bytes:
+        return True
+    for url in urls:
+        if _download_file(url, dest, min_bytes=min_bytes):
+            _log.info("[ok] %s (%d bytes)", dest.name, dest.stat().st_size)
+            return True
+    return False
 
 
 def ensure_person_det_weights(root: Path | None = None) -> Path:
+    """Best-effort download; never raises (HOG fallback if DNN weights missing)."""
     root = Path(root or DNN_DIR)
-    _download_file(PROTOTXT_URL, root / PROTOTXT_NAME)
-    _download_file(CAFFEMODEL_URL, root / CAFFEMODEL_NAME)
+    root.mkdir(parents=True, exist_ok=True)
+    got_pt = _download_first(PROTOTXT_URLS, root / PROTOTXT_NAME, min_bytes=1000)
+    got_cm = _download_first(CAFFEMODEL_URLS, root / CAFFEMODEL_NAME, min_bytes=1_000_000)
+    if not got_pt or not got_cm:
+        _log.warning(
+            "Person DNN weights incomplete (prototxt=%s caffemodel=%s) — will use HOG fallback",
+            got_pt,
+            got_cm,
+        )
     return root
 
 
@@ -85,19 +116,17 @@ class PersonDetector:
         self._net: cv2.dnn.Net | None = None
         self._hog = cv2.HOGDescriptor()
         self._hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-        self._use_hog = True
-        try:
-            wdir = ensure_person_det_weights(weights_dir)
-            prototxt = wdir / PROTOTXT_NAME
-            caffemodel = wdir / CAFFEMODEL_NAME
-            if prototxt.is_file() and caffemodel.is_file() and caffemodel.stat().st_size > 1_000_000:
+        wdir = ensure_person_det_weights(weights_dir)
+        prototxt = wdir / PROTOTXT_NAME
+        caffemodel = wdir / CAFFEMODEL_NAME
+        if prototxt.is_file() and caffemodel.is_file() and caffemodel.stat().st_size > 1_000_000:
+            try:
                 self._net = cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
-                self._use_hog = False
                 _log.info("Person detector: MobileNet-SSD DNN")
-            else:
-                _log.warning("Person DNN weights missing — using HOG fallback")
-        except Exception as exc:
-            _log.warning("Person DNN load failed (%s) — HOG fallback", exc)
+            except Exception as exc:
+                _log.warning("Person DNN load failed (%s) — HOG fallback", exc)
+        else:
+            _log.warning("Person DNN weights missing — using HOG fallback")
 
     def detect(self, image_bgr: np.ndarray) -> List[BBox]:
         if self._net is not None:
@@ -214,9 +243,6 @@ class PersonCropTracker:
         return self._smooth
 
     def crop_regions(self, image_bgr: np.ndarray) -> Tuple[List[np.ndarray], List[BBox], bool]:
-        """
-        Returns list of crop images, boxes on full plate, used_full_frame flag.
-        """
         h, w = image_bgr.shape[:2]
         raw = self._detector.detect(image_bgr)
         picks = self._pick_boxes(raw, w, h)
@@ -244,8 +270,8 @@ class PersonCropTracker:
     def paste_matte(full_h: int, full_w: int, crop_alpha: np.ndarray, box: BBox) -> np.ndarray:
         out = np.zeros((full_h, full_w), dtype=np.float32)
         sy, sx = box.as_slice()
-        ch, cw = sy.stop - sy.start, sx.stop - sx.start
         alpha = crop_alpha
+        ch, cw = sy.stop - sy.start, sx.stop - sx.start
         if alpha.shape[:2] != (ch, cw):
             alpha = cv2.resize(alpha, (cw, ch), interpolation=cv2.INTER_LINEAR)
         alpha = alpha.astype(np.float32).clip(0.0, 1.0)
@@ -258,8 +284,8 @@ class PersonCropTracker:
     ) -> np.ndarray:
         out = np.zeros((full_h, full_w, 3), dtype=np.float32)
         sy, sx = box.as_slice()
-        ch, cw = sy.stop - sy.start, sx.stop - sx.start
         nrm = crop_normal
+        ch, cw = sy.stop - sy.start, sx.stop - sx.start
         if nrm.shape[:2] != (ch, cw):
             nrm = cv2.resize(nrm, (cw, ch), interpolation=cv2.INTER_LINEAR)
         nrm = np.ascontiguousarray(nrm.astype(np.float32))
