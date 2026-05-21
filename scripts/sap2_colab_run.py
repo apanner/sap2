@@ -47,8 +47,9 @@ SAP2_DEFAULTS: dict[str, Any] = {
     "batch_gap_seconds": 5,
     "checkpoint_root": "",
     "download_models_in_colab": True,
-    # 0 = auto from VRAM (80GB → 4096 long edge); else cap inference long edge (px)
+    # 0 = auto (safe cap ~2048 long edge / 1.6 MP); manual override in Desk
     "inference_long_edge": 0,
+    "inference_max_megapixels": 1.6,
 }
 
 from sap2_models import MODEL_CONFIGS  # noqa: E402
@@ -268,6 +269,7 @@ def _run_shot(
     normal_done = _exr_count(normal_dir) >= n_frames if export_normal else True
 
     long_edge = int(shared.get("inference_long_edge", 0))
+    max_mp = float(shared.get("inference_max_megapixels", 1.6))
     device = "cuda:0"
     try:
         import torch
@@ -280,9 +282,10 @@ def _run_shot(
     from sap2_infer import Sap2ShotProcessor, vram_auto_long_edge
 
     _log.info(
-        "Inference long_edge=%s (auto=%d on this GPU)",
+        "Inference long_edge=%s (auto=%d) max_megapixels=%.1f",
         long_edge or "auto",
         vram_auto_long_edge(),
+        max_mp,
     )
 
     if run_matting and not matte_done:
@@ -292,15 +295,27 @@ def _run_shot(
         if not ckpt.is_file():
             raise FileNotFoundError(f"Matting checkpoint missing: {ckpt}")
         matte_dir.mkdir(parents=True, exist_ok=True)
-        proc = Sap2ShotProcessor(_DENSE, ckpt_root, model_key=model_key, device=device, inference_long_edge=long_edge)
+        proc = Sap2ShotProcessor(
+            _DENSE,
+            ckpt_root,
+            model_key=model_key,
+            device=device,
+            inference_long_edge=long_edge,
+            max_megapixels=max_mp,
+        )
         try:
+            done = 0
             for fi in range(frame_start, frame_end + 1):
                 exr_out = matte_dir / f"matte_{fi:06d}.exr"
                 if exr_out.is_file() and export_matte:
+                    done += 1
                     continue
                 alpha = proc.process_frame_matting(cache_path(cache_dir, fi))
                 if export_matte:
                     write_alpha_exr(exr_out, alpha)
+                done += 1
+                if done == 1 or done % 10 == 0 or done == n_frames:
+                    _log.info("Matte EXR %d/%d", done, n_frames)
         finally:
             proc.unload()
     elif run_matting:
@@ -311,7 +326,14 @@ def _run_shot(
         if not ckpt.is_file():
             raise FileNotFoundError(f"Normal checkpoint missing: {ckpt}")
         normal_dir.mkdir(parents=True, exist_ok=True)
-        proc = Sap2ShotProcessor(_DENSE, ckpt_root, model_key=model_key, device=device, inference_long_edge=long_edge)
+        proc = Sap2ShotProcessor(
+            _DENSE,
+            ckpt_root,
+            model_key=model_key,
+            device=device,
+            inference_long_edge=long_edge,
+            max_megapixels=max_mp,
+        )
         try:
             done = 0
             for fi in range(frame_start, frame_end + 1):
