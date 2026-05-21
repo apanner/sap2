@@ -47,6 +47,15 @@ def load_sap2_config_cell2(drive_service, config_file_id):
             print("   Config download: " + str(int(status.progress() * 100)) + "%")
     with open(config_path, encoding="utf-8") as f:
         config = json.load(f)
+    shared = config.get("shared") or config.get("shared_settings") or {}
+    drive = "/content/drive/MyDrive"
+    out_base = str(shared.get("output_folder_path") or "VDA_output").strip().strip("/")
+    if not out_base.startswith("/content/drive"):
+        shared["output_folder_path"] = f"{drive}/{out_base}"
+    config["shared"] = shared
+    config["shared_settings"] = shared
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
     is_batch = bool(config.get("sequences"))
     date_folder = datetime.now().strftime("%Y%m%d")
     os.environ["SAP2_DRIVE_MOUNT"] = "/content/drive/MyDrive"
@@ -58,6 +67,7 @@ def load_sap2_config_cell2(drive_service, config_file_id):
         logger.addHandler(h)
         logger.setLevel(logging.INFO)
     print("[OK] SAP2 config loaded — batch=" + str(is_batch) + " date=" + date_folder)
+    print("   Drive output:", shared["output_folder_path"] + "/" + date_folder + "/" + str(shared.get("sap2_output_root", "SAP2_output")))
     print("   Models will download to:", COLAB_CHECKPOINT_ROOT)
     print("   Shots:", len(config.get("sequences") or []))
     return config, "/content/drive/MyDrive", date_folder, logger, is_batch, config_path
