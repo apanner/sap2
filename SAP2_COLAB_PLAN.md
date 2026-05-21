@@ -98,4 +98,4 @@ Cell 3 downloads to `/content/sapiens2_checkpoints`:
 - `matting/sapiens2_1b_matting.safetensors`
 - `normal/sapiens2_1b_normal.safetensors`
 
-Person detector weights: `/content/sap2_models/person_det/` (MobileNet-SSD, auto-download).
+Person detect: try MobileNet-SSD (`/content/sap2_models/person_det/`); **if that fails → OpenCV HOG** (no download). Force HOG only: `SAP2_PERSON_DET_BACKEND=hog`.

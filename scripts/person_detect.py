@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""OpenCV person detection + crop/paste for SAP2 native 1024×768 infer."""
+"""
+Person detection for SAP2 person-crop.
+
+1. Try MobileNet-SSD DNN (optional download)
+2. Fall back to OpenCV HOG people detector (always available, no download)
+"""
 
 from __future__ import annotations
 
@@ -9,7 +14,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -21,7 +26,6 @@ DNN_DIR = Path(os.environ.get("SAP2_PERSON_DET_DIR", "/content/sap2_models/perso
 PROTOTXT_NAME = "MobileNetSSD_deploy.prototxt"
 CAFFEMODEL_NAME = "MobileNetSSD_deploy.caffemodel"
 
-# chuanqi305 raw master URLs 404; use mirrors that still host the VOC deploy files
 PROTOTXT_URLS = (
     "https://raw.githubusercontent.com/djmv/MobilNet_SSD_opencv/master/MobileNetSSD_deploy.prototxt",
     "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/voc/MobileNetSSD_deploy.prototxt",
@@ -29,6 +33,8 @@ PROTOTXT_URLS = (
 CAFFEMODEL_URLS = (
     "https://raw.githubusercontent.com/djmv/MobilNet_SSD_opencv/master/MobileNetSSD_deploy.caffemodel",
 )
+
+DetBackend = Literal["mobilenet", "hog"]
 
 
 @dataclass
@@ -88,66 +94,93 @@ def _download_first(urls: tuple[str, ...], dest: Path, *, min_bytes: int) -> boo
     return False
 
 
-def ensure_person_det_weights(root: Path | None = None) -> Path:
-    """Best-effort download; never raises (HOG fallback if DNN weights missing)."""
+def ensure_person_det_weights(root: Path | None = None, *, try_download: bool = True) -> Path:
+    """Optional prefetch; never raises. Missing weights → OpenCV HOG at detect time."""
     root = Path(root or DNN_DIR)
     root.mkdir(parents=True, exist_ok=True)
+    if not try_download:
+        return root
     got_pt = _download_first(PROTOTXT_URLS, root / PROTOTXT_NAME, min_bytes=1000)
     got_cm = _download_first(CAFFEMODEL_URLS, root / CAFFEMODEL_NAME, min_bytes=1_000_000)
     if not got_pt or not got_cm:
-        _log.warning(
-            "Person DNN weights incomplete (prototxt=%s caffemodel=%s) — will use HOG fallback",
+        _log.info(
+            "MobileNet-SSD weights unavailable (prototxt=%s caffemodel=%s) — using OpenCV HOG",
             got_pt,
             got_cm,
         )
     return root
 
 
+def _try_load_mobilenet(weights_dir: Path | None) -> cv2.dnn.Net | None:
+    root = Path(weights_dir or DNN_DIR)
+    prototxt = root / PROTOTXT_NAME
+    caffemodel = root / CAFFEMODEL_NAME
+    if not prototxt.is_file() or not caffemodel.is_file():
+        return None
+    if caffemodel.stat().st_size < 1_000_000:
+        return None
+    try:
+        return cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
+    except Exception as exc:
+        _log.warning("MobileNet-SSD load failed: %s", exc)
+        return None
+
+
 class PersonDetector:
-    """MobileNet-SSD (person class) with HOG fallback."""
+    """MobileNet-SSD first; OpenCV HOG if DNN missing or finds no person."""
 
     def __init__(
         self,
         *,
-        min_confidence: float = 0.4,
+        min_confidence: float = 0.35,
         weights_dir: Path | None = None,
+        try_mobilenet_download: bool = True,
     ):
         self.min_confidence = float(min_confidence)
-        self._net: cv2.dnn.Net | None = None
         self._hog = cv2.HOGDescriptor()
         self._hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-        wdir = ensure_person_det_weights(weights_dir)
-        prototxt = wdir / PROTOTXT_NAME
-        caffemodel = wdir / CAFFEMODEL_NAME
-        if prototxt.is_file() and caffemodel.is_file() and caffemodel.stat().st_size > 1_000_000:
-            try:
-                self._net = cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
-                _log.info("Person detector: MobileNet-SSD DNN")
-            except Exception as exc:
-                _log.warning("Person DNN load failed (%s) — HOG fallback", exc)
+        self._net: cv2.dnn.Net | None = None
+        self._backend: DetBackend = "hog"
+
+        force = os.environ.get("SAP2_PERSON_DET_BACKEND", "auto").strip().lower()
+        if force == "hog":
+            _log.info("Person detect: OpenCV HOG (forced by SAP2_PERSON_DET_BACKEND)")
+            return
+
+        if try_mobilenet_download and force != "hog":
+            ensure_person_det_weights(weights_dir, try_download=True)
+
+        self._net = _try_load_mobilenet(weights_dir)
+        if self._net is not None and force != "hog":
+            self._backend = "mobilenet"
+            _log.info("Person detect: MobileNet-SSD DNN (OpenCV HOG fallback if no hits)")
         else:
-            _log.warning("Person DNN weights missing — using HOG fallback")
+            _log.info("Person detect: OpenCV HOG (built-in, no download)")
 
     def detect(self, image_bgr: np.ndarray) -> List[BBox]:
+        boxes: List[BBox] = []
         if self._net is not None:
-            boxes = self._detect_dnn(image_bgr)
-            if boxes:
-                return boxes
-        return self._detect_hog(image_bgr)
+            boxes = self._detect_mobilenet(image_bgr)
+        if not boxes:
+            boxes = self._detect_hog(image_bgr)
+        return boxes
 
-    def _detect_dnn(self, image_bgr: np.ndarray) -> List[BBox]:
+    def _scaled_image(self, image_bgr: np.ndarray, det_long: int = 1280) -> tuple[np.ndarray, float]:
+        h, w = image_bgr.shape[:2]
+        if max(h, w) <= det_long:
+            return image_bgr, 1.0
+        scale = det_long / max(h, w)
+        small = cv2.resize(
+            image_bgr,
+            (int(w * scale), int(h * scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+        return small, scale
+
+    def _detect_mobilenet(self, image_bgr: np.ndarray) -> List[BBox]:
         assert self._net is not None
         h, w = image_bgr.shape[:2]
-        det_long = 1280
-        scale = 1.0
-        det_img = image_bgr
-        if max(h, w) > det_long:
-            scale = det_long / max(h, w)
-            det_img = cv2.resize(
-                image_bgr,
-                (int(w * scale), int(h * scale)),
-                interpolation=cv2.INTER_AREA,
-            )
+        det_img, scale = self._scaled_image(image_bgr)
         dh, dw = det_img.shape[:2]
         blob = cv2.dnn.blobFromImage(
             det_img, scalefactor=0.007843, size=(300, 300), mean=127.5
@@ -160,8 +193,7 @@ class PersonDetector:
             conf = float(det[0, 0, i, 2])
             if conf < self.min_confidence:
                 continue
-            class_id = int(det[0, 0, i, 1])
-            if class_id != PERSON_CLASS_ID_MOBILENET:
+            if int(det[0, 0, i, 1]) != PERSON_CLASS_ID_MOBILENET:
                 continue
             x1 = int(det[0, 0, i, 3] * dw * inv)
             y1 = int(det[0, 0, i, 4] * dh * inv)
@@ -173,20 +205,13 @@ class PersonDetector:
 
     def _detect_hog(self, image_bgr: np.ndarray) -> List[BBox]:
         h, w = image_bgr.shape[:2]
-        det_img = image_bgr
-        scale = 1.0
-        if max(h, w) > 1280:
-            scale = 1280 / max(h, w)
-            det_img = cv2.resize(
-                image_bgr,
-                (int(w * scale), int(h * scale)),
-                interpolation=cv2.INTER_AREA,
-            )
+        det_img, scale = self._scaled_image(image_bgr)
         rects, _weights = self._hog.detectMultiScale(
             det_img,
             winStride=(8, 8),
             padding=(16, 16),
-            scale=1.05,
+            scale=1.04,
+            hitThreshold=0,
         )
         inv = 1.0 / scale
         boxes: List[BBox] = []
@@ -209,7 +234,7 @@ class PersonCropTracker:
         self,
         *,
         pad_ratio: float = 0.18,
-        min_confidence: float = 0.4,
+        min_confidence: float = 0.35,
         smooth_alpha: float = 0.72,
         merge_multi: bool = True,
         weights_dir: Path | None = None,
@@ -217,7 +242,11 @@ class PersonCropTracker:
         self.pad_ratio = float(pad_ratio)
         self.merge_multi = bool(merge_multi)
         self.smooth_alpha = float(smooth_alpha)
-        self._detector = PersonDetector(min_confidence=min_confidence, weights_dir=weights_dir)
+        self._detector = PersonDetector(
+            min_confidence=min_confidence,
+            weights_dir=weights_dir,
+            try_mobilenet_download=True,
+        )
         self._smooth: Optional[BBox] = None
         self._full_frame_fallbacks = 0
 
@@ -249,7 +278,7 @@ class PersonCropTracker:
         if not picks:
             self._full_frame_fallbacks += 1
             if self._full_frame_fallbacks == 1:
-                _log.warning("No person detected — full-frame infer fallback")
+                _log.warning("No person detected (MobileNet + HOG) — full-frame infer fallback")
             return [image_bgr], [BBox(0, 0, w, h)], True
 
         crops: List[np.ndarray] = []

@@ -428,12 +428,9 @@ def _run_batch(job_path: Path, shot_index: int | None, pass_name: str) -> int:
     ckpt_root = _checkpoint_root(shared)
     _ensure_models_if_needed(shared, ckpt_root, pass_name=pass_name)
     if bool(shared.get("use_person_crop", True)):
-        from person_detect import ensure_person_det_weights
-
-        try:
-            ensure_person_det_weights()
-        except Exception as exc:
-            _log.warning("Person detector download skipped (%s) — HOG fallback", exc)
+        _log.info(
+            "Person crop: try MobileNet-SSD; if download/load fails → OpenCV HOG (built-in)"
+        )
     os.environ["SAPIENS_CHECKPOINT_ROOT"] = str(ckpt_root)
 
     _log.info("Local output (VDA): %s", _local_output_root().resolve())
