@@ -21,7 +21,7 @@ os.environ.setdefault("SAPIENS_CHECKPOINT_ROOT", str(_SAP2_ROOT / "checkpoints")
 
 from exr_io import write_alpha_exr, write_normal_exr  # noqa: E402
 from plate_cache import build_plate_jpeg_cache, cache_path, plate_cache_complete  # noqa: E402
-from sap2_infer import Sap2ShotProcessor, vram_auto_long_edge  # noqa: E402
+from sap2_infer import MODEL_NATIVE_H, MODEL_NATIVE_W, Sap2ShotProcessor  # noqa: E402
 
 _log = logging.getLogger("sap2_engine")
 
@@ -64,7 +64,7 @@ def process_shot(job: dict) -> bool:
     n_frames = frame_end - frame_start + 1
 
     _log.info("SAP2 shot=%s frames %d-%d → %s", shot, frame_start, frame_end, out_shot)
-    _log.info("VRAM auto long_edge=%d (override=%s)", vram_auto_long_edge(), long_edge or "auto")
+    _log.info("Infer %d×%d native (long_edge setting %s ignored)", MODEL_NATIVE_H, MODEL_NATIVE_W, long_edge or "0")
 
     if bool(shared.get("use_plate_jpeg_cache", True)):
         if not plate_cache_complete(cache_dir, frame_start, frame_end):
