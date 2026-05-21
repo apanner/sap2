@@ -44,7 +44,7 @@ SAP2_DEFAULTS: dict[str, Any] = {
     "checkpoint_root": "",
     "download_models_in_colab": True,
     "inference_long_edge": 0,
-    "inference_max_megapixels": 1.6,
+    "inference_max_megapixels": 0,
 }
 
 from sap2_models import MODEL_CONFIGS  # noqa: E402
@@ -289,7 +289,7 @@ def _run_shot(
             _log.info("JPEG cache ready: %s", cache_dir)
 
     long_edge = int(shared.get("inference_long_edge", 0))
-    max_mp = float(shared.get("inference_max_megapixels", 1.6))
+    max_mp = float(shared.get("inference_max_megapixels", 0))
     device = "cuda:0"
     try:
         import torch
@@ -303,9 +303,13 @@ def _run_shot(
     except ImportError:
         device = "cpu"
 
-    from sap2_infer import Sap2ShotProcessor, vram_auto_long_edge
+    from sap2_infer import MODEL_NATIVE_H, MODEL_NATIVE_W, Sap2ShotProcessor
 
-    _log.info("Infer long_edge=%s auto=%d max_mp=%.1f", long_edge or "auto", vram_auto_long_edge(), max_mp)
+    _log.info(
+        "Infer locked to model native %d×%d (plate EXR stays full res)",
+        MODEL_NATIVE_H,
+        MODEL_NATIVE_W,
+    )
 
     if run_matting and not matte_done:
         ckpt = ckpt_root / cfg["matting_ckpt"]

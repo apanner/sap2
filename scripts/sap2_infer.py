@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Sapiens2 matting + normals — infer capped for GPU safety, full-res EXR output."""
+"""Sapiens2 matting + normals — infer at model-native 1024×768, full-res EXR output."""
 
 from __future__ import annotations
 
@@ -16,57 +16,22 @@ import torch.nn.functional as F
 
 _log = logging.getLogger("sap2_infer")
 
-# Training default H×W (Sapiens2 dense heads)
-_BASE_H = 1024
-_BASE_W = 768
-_TRAIN_PIXELS = _BASE_H * _BASE_W
-# Cap infer pixels (~2× train area); prevents Colab SIGSEGV (-11) on 4K plates
-_DEFAULT_MAX_INFER_MP = 1.6
-
-
-def vram_auto_long_edge() -> int:
-    """Conservative long edge — 1B dense heads OOM above ~2048 on most Colab GPUs."""
-    if not torch.cuda.is_available():
-        return _BASE_H
-    gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    if gb >= 70:
-        return 2048
-    if gb >= 40:
-        return 1536
-    if gb >= 22:
-        return 1280
-    if gb >= 14:
-        return 1024
-    return 768
-
-
-def infer_size_hw(
-    plate_h: int,
-    plate_w: int,
-    *,
-    long_edge: int = 0,
-    max_megapixels: float = _DEFAULT_MAX_INFER_MP,
-    max_h: int = 2048,
-    max_w: int = 2048,
-) -> tuple[int, int]:
-    """Return (height, width) for pipeline, multiples of 16."""
-    le = int(long_edge) if int(long_edge) > 0 else vram_auto_long_edge()
-    le = min(le, max_h, max_w, int(max_megapixels**0.5 * 1600))
-    scale = le / max(plate_h, plate_w, 1)
-    h = max(16, int(round(plate_h * scale / 16) * 16))
-    w = max(16, int(round(plate_w * scale / 16) * 16))
-    h = min(h, max_h)
-    w = min(w, max_w)
-
-    cap_px = int(float(max_megapixels) * 1_000_000)
-    if cap_px > 0 and h * w > cap_px:
-        shrink = (cap_px / (h * w)) ** 0.5
-        h = max(16, int(round(h * shrink / 16) * 16))
-        w = max(16, int(round(w * shrink / 16) * 16))
-    return h, w
+# All sapiens2_* dense configs are trained/tested at this H×W (see *-1024x768.py)
+MODEL_NATIVE_H = 1024
+MODEL_NATIVE_W = 768
 
 
 def patch_pipeline_size(model: Any, height: int, width: int) -> None:
+    """Only patch when matching model-native size (config default)."""
+    if int(height) != MODEL_NATIVE_H or int(width) != MODEL_NATIVE_W:
+        _log.warning(
+            "Ignoring pipeline resize %d×%d — model capacity is %d×%d only",
+            height,
+            width,
+            MODEL_NATIVE_H,
+            MODEL_NATIVE_W,
+        )
+        return
     for t in getattr(model.pipeline, "transforms", []):
         if hasattr(t, "height") and hasattr(t, "width"):
             t.height = int(height)
@@ -77,8 +42,6 @@ def _init_task_model(
     dense_root: Path,
     config_rel: str,
     ckpt: Path,
-    infer_h: int,
-    infer_w: int,
     device: str,
 ) -> Any:
     import os
@@ -92,7 +55,8 @@ def _init_task_model(
         from sapiens.dense.models import init_model
 
         model = init_model(str(config_rel), str(ckpt), device=device)
-        patch_pipeline_size(model, infer_h, infer_w)
+        model.float()
+        patch_pipeline_size(model, MODEL_NATIVE_H, MODEL_NATIVE_W)
         return model
     finally:
         os.chdir(prev)
@@ -101,7 +65,6 @@ def _init_task_model(
 def _run_matting_frame(model: Any, image_bgr: np.ndarray, device: str) -> np.ndarray:
     data = model.pipeline(dict(img=image_bgr))
     data = model.data_preprocessor(data)
-    # Match upstream vis_matting.py: float32, no autocast (bf16 mismatch crashes on some GPUs)
     with torch.inference_mode():
         out = model(data["inputs"])
     out = F.interpolate(
@@ -141,7 +104,7 @@ def _run_normal_frame(model: Any, image_bgr: np.ndarray, device: str) -> np.ndar
 
 
 class Sap2ShotProcessor:
-    """JPEG plates → matte/normal EXR at full plate resolution."""
+    """Full-res plates → native 1024×768 infer → matte/normal EXR at plate resolution."""
 
     def __init__(
         self,
@@ -150,14 +113,25 @@ class Sap2ShotProcessor:
         model_key: str = "1b",
         device: str = "cuda:0",
         inference_long_edge: int = 0,
-        max_megapixels: float = _DEFAULT_MAX_INFER_MP,
+        max_megapixels: float = 0.0,
     ):
         self.dense_root = Path(dense_root)
         self.ckpt_root = Path(ckpt_root)
         self.model_key = model_key.replace("sapiens2_", "")
         self.device = device
-        self.inference_long_edge = int(inference_long_edge)
-        self.max_megapixels = float(max_megapixels)
+        if int(inference_long_edge) > 0:
+            _log.warning(
+                "inference_long_edge=%s ignored — Sapiens2 dense heads run at %d×%d only",
+                inference_long_edge,
+                MODEL_NATIVE_H,
+                MODEL_NATIVE_W,
+            )
+        if float(max_megapixels or 0) > 0:
+            _log.warning(
+                "inference_max_megapixels ignored — engine uses model-native %d×%d",
+                MODEL_NATIVE_H,
+                MODEL_NATIVE_W,
+            )
         self._matting_model = None
         self._normal_model = None
 
@@ -165,29 +139,20 @@ class Sap2ShotProcessor:
 
         self._cfg = MODEL_CONFIGS.get(self.model_key, MODEL_CONFIGS["1b"])
 
-    def _log_infer_size(self, label: str, plate_h: int, plate_w: int) -> tuple[int, int]:
-        ih, iw = infer_size_hw(
+    def _log_native_infer(self, label: str, plate_h: int, plate_w: int) -> None:
+        _log.info(
+            "%s: plate %d×%d → model %d×%d (native) → upsample EXR to plate",
+            label,
             plate_h,
             plate_w,
-            long_edge=self.inference_long_edge,
-            max_megapixels=self.max_megapixels,
+            MODEL_NATIVE_H,
+            MODEL_NATIVE_W,
         )
-        mp = ih * iw / 1e6
-        _log.info(
-            "%s infer H×W = %d×%d (%.2f MP, long_edge=%s, cap=%.1f MP)",
-            label,
-            ih,
-            iw,
-            mp,
-            self.inference_long_edge or "auto",
-            self.max_megapixels,
-        )
-        return ih, iw
 
     def _ensure_matting(self, plate_h: int, plate_w: int) -> None:
         if self._matting_model is not None:
             return
-        ih, iw = self._log_infer_size("Matting", plate_h, plate_w)
+        self._log_native_infer("Matting", plate_h, plate_w)
         ckpt = self.ckpt_root / self._cfg["matting_ckpt"]
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -195,15 +160,13 @@ class Sap2ShotProcessor:
             self.dense_root,
             self._cfg["matting_config"],
             ckpt,
-            ih,
-            iw,
             self.device,
         )
 
     def _ensure_normal(self, plate_h: int, plate_w: int) -> None:
         if self._normal_model is not None:
             return
-        ih, iw = self._log_infer_size("Normal", plate_h, plate_w)
+        self._log_native_infer("Normal", plate_h, plate_w)
         ckpt = self.ckpt_root / self._cfg["normal_ckpt"]
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -211,8 +174,6 @@ class Sap2ShotProcessor:
             self.dense_root,
             self._cfg["normal_config"],
             ckpt,
-            ih,
-            iw,
             self.device,
         )
 
