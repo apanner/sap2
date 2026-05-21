@@ -45,6 +45,11 @@ SAP2_DEFAULTS: dict[str, Any] = {
     "download_models_in_colab": True,
     "inference_long_edge": 0,
     "inference_max_megapixels": 0,
+    "use_person_crop": True,
+    "person_crop_pad": 0.18,
+    "person_crop_confidence": 0.4,
+    "person_crop_smooth": 0.72,
+    "person_crop_multi": True,
 }
 
 from sap2_models import MODEL_CONFIGS  # noqa: E402
@@ -290,6 +295,13 @@ def _run_shot(
 
     long_edge = int(shared.get("inference_long_edge", 0))
     max_mp = float(shared.get("inference_max_megapixels", 0))
+    proc_kw = dict(
+        use_person_crop=bool(shared.get("use_person_crop", True)),
+        person_crop_pad=float(shared.get("person_crop_pad", 0.18)),
+        person_crop_confidence=float(shared.get("person_crop_confidence", 0.4)),
+        person_crop_smooth=float(shared.get("person_crop_smooth", 0.72)),
+        person_crop_multi=bool(shared.get("person_crop_multi", True)),
+    )
     device = "cuda:0"
     try:
         import torch
@@ -319,6 +331,7 @@ def _run_shot(
         proc = Sap2ShotProcessor(
             _DENSE, ckpt_root, model_key=model_key, device=device,
             inference_long_edge=long_edge, max_megapixels=max_mp,
+            **proc_kw,
         )
         try:
             done = 0
@@ -412,6 +425,10 @@ def _run_batch(job_path: Path, shot_index: int | None, pass_name: str) -> int:
     _local_output_root().mkdir(parents=True, exist_ok=True)
     ckpt_root = _checkpoint_root(shared)
     _ensure_models_if_needed(shared, ckpt_root, pass_name=pass_name)
+    if bool(shared.get("use_person_crop", True)):
+        from person_detect import ensure_person_det_weights
+
+        ensure_person_det_weights()
     os.environ["SAPIENS_CHECKPOINT_ROOT"] = str(ckpt_root)
 
     _log.info("Local output (VDA): %s", _local_output_root().resolve())

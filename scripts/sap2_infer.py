@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Sapiens2 matting + normals — infer at model-native 1024×768, full-res EXR output."""
+"""Sapiens2 matting + normals — native 1024×768; optional person-crop infer."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import gc
 import logging
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, List
 
 import cv2
 import numpy as np
@@ -16,13 +16,11 @@ import torch.nn.functional as F
 
 _log = logging.getLogger("sap2_infer")
 
-# All sapiens2_* dense configs are trained/tested at this H×W (see *-1024x768.py)
 MODEL_NATIVE_H = 1024
 MODEL_NATIVE_W = 768
 
 
 def patch_pipeline_size(model: Any, height: int, width: int) -> None:
-    """Only patch when matching model-native size (config default)."""
     if int(height) != MODEL_NATIVE_H or int(width) != MODEL_NATIVE_W:
         _log.warning(
             "Ignoring pipeline resize %d×%d — model capacity is %d×%d only",
@@ -104,7 +102,7 @@ def _run_normal_frame(model: Any, image_bgr: np.ndarray, device: str) -> np.ndar
 
 
 class Sap2ShotProcessor:
-    """Full-res plates → native 1024×768 infer → matte/normal EXR at plate resolution."""
+    """Full-res plates → person crop (optional) → 1024×768 infer → full-res EXR."""
 
     def __init__(
         self,
@@ -114,45 +112,51 @@ class Sap2ShotProcessor:
         device: str = "cuda:0",
         inference_long_edge: int = 0,
         max_megapixels: float = 0.0,
+        *,
+        use_person_crop: bool = True,
+        person_crop_pad: float = 0.18,
+        person_crop_confidence: float = 0.4,
+        person_crop_smooth: float = 0.72,
+        person_crop_multi: bool = True,
     ):
         self.dense_root = Path(dense_root)
         self.ckpt_root = Path(ckpt_root)
         self.model_key = model_key.replace("sapiens2_", "")
         self.device = device
-        if int(inference_long_edge) > 0:
-            _log.warning(
-                "inference_long_edge=%s ignored — Sapiens2 dense heads run at %d×%d only",
-                inference_long_edge,
-                MODEL_NATIVE_H,
-                MODEL_NATIVE_W,
-            )
-        if float(max_megapixels or 0) > 0:
-            _log.warning(
-                "inference_max_megapixels ignored — engine uses model-native %d×%d",
-                MODEL_NATIVE_H,
-                MODEL_NATIVE_W,
-            )
+        self.use_person_crop = bool(use_person_crop)
+        if int(inference_long_edge) > 0 or float(max_megapixels or 0) > 0:
+            _log.info("infer size overrides ignored — model native %d×%d", MODEL_NATIVE_H, MODEL_NATIVE_W)
         self._matting_model = None
         self._normal_model = None
+        self._crop_tracker = None
 
         from sap2_models import MODEL_CONFIGS
 
         self._cfg = MODEL_CONFIGS.get(self.model_key, MODEL_CONFIGS["1b"])
+        if self.use_person_crop:
+            from person_detect import PersonCropTracker
 
-    def _log_native_infer(self, label: str, plate_h: int, plate_w: int) -> None:
-        _log.info(
-            "%s: plate %d×%d → model %d×%d (native) → upsample EXR to plate",
-            label,
-            plate_h,
-            plate_w,
-            MODEL_NATIVE_H,
-            MODEL_NATIVE_W,
-        )
+            self._crop_tracker = PersonCropTracker(
+                pad_ratio=person_crop_pad,
+                min_confidence=person_crop_confidence,
+                smooth_alpha=person_crop_smooth,
+                merge_multi=person_crop_multi,
+            )
+            _log.info(
+                "Person-crop infer ON (pad=%.0f%%, conf=%.2f, multi=%s)",
+                person_crop_pad * 100,
+                person_crop_confidence,
+                person_crop_multi,
+            )
+
+    def _log_infer_mode(self, label: str, plate_h: int, plate_w: int) -> None:
+        mode = "person crop → 1024×768" if self.use_person_crop else "full frame → 1024×768"
+        _log.info("%s: plate %d×%d — %s → EXR full res", label, plate_h, plate_w, mode)
 
     def _ensure_matting(self, plate_h: int, plate_w: int) -> None:
         if self._matting_model is not None:
             return
-        self._log_native_infer("Matting", plate_h, plate_w)
+        self._log_infer_mode("Matting", plate_h, plate_w)
         ckpt = self.ckpt_root / self._cfg["matting_ckpt"]
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -166,7 +170,7 @@ class Sap2ShotProcessor:
     def _ensure_normal(self, plate_h: int, plate_w: int) -> None:
         if self._normal_model is not None:
             return
-        self._log_native_infer("Normal", plate_h, plate_w)
+        self._log_infer_mode("Normal", plate_h, plate_w)
         ckpt = self.ckpt_root / self._cfg["normal_ckpt"]
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -177,19 +181,45 @@ class Sap2ShotProcessor:
             self.device,
         )
 
+    def _infer_matting_crops(self, crops: List[np.ndarray]) -> List[np.ndarray]:
+        assert self._matting_model is not None
+        return [_run_matting_frame(self._matting_model, c, self.device) for c in crops]
+
+    def _infer_normal_crops(self, crops: List[np.ndarray]) -> List[np.ndarray]:
+        assert self._normal_model is not None
+        return [_run_normal_frame(self._normal_model, c, self.device) for c in crops]
+
     def process_frame_matting(self, jpeg_path: Path) -> np.ndarray:
         img = cv2.imread(str(jpeg_path))
         if img is None:
             raise FileNotFoundError(jpeg_path)
-        self._ensure_matting(img.shape[0], img.shape[1])
-        return _run_matting_frame(self._matting_model, img, self.device)
+        h, w = img.shape[:2]
+        self._ensure_matting(h, w)
+
+        if not self.use_person_crop or self._crop_tracker is None:
+            return _run_matting_frame(self._matting_model, img, self.device)
+
+        crops, boxes, _full = self._crop_tracker.crop_regions(img)
+        mattes = self._infer_matting_crops(crops)
+        if len(mattes) == 1:
+            return self._crop_tracker.paste_matte(h, w, mattes[0], boxes[0])
+        return self._crop_tracker.merge_mattes(h, w, mattes, boxes)
 
     def process_frame_normal(self, jpeg_path: Path) -> np.ndarray:
         img = cv2.imread(str(jpeg_path))
         if img is None:
             raise FileNotFoundError(jpeg_path)
-        self._ensure_normal(img.shape[0], img.shape[1])
-        return _run_normal_frame(self._normal_model, img, self.device)
+        h, w = img.shape[:2]
+        self._ensure_normal(h, w)
+
+        if not self.use_person_crop or self._crop_tracker is None:
+            return _run_normal_frame(self._normal_model, img, self.device)
+
+        crops, boxes, _full = self._crop_tracker.crop_regions(img)
+        normals = self._infer_normal_crops(crops)
+        if len(normals) == 1:
+            return self._crop_tracker.paste_normal(h, w, normals[0], boxes[0])
+        return self._crop_tracker.merge_normals(h, w, normals, boxes)
 
     def unload(self) -> None:
         for attr in ("_matting_model", "_normal_model"):
@@ -197,6 +227,7 @@ class Sap2ShotProcessor:
             if m is not None:
                 del m
             setattr(self, attr, None)
+        self._crop_tracker = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

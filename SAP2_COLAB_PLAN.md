@@ -10,32 +10,31 @@
 | **Matte** | SAM3 track → BiRefNet / ViTMatte refine | Single **human matting** head (`sapiens2_1b_matting`) |
 | **Normals** | — | **Surface normals** (`sapiens2_*_normal`) |
 | **Input** | Any foreground (text prompts) | **Human-centric** (people in frame) |
-| **Native infer res** | Full-res refine optional | **1024×768 (H×W)** internal; upsampled to plate size |
+| **Native infer res** | Full-res refine optional | **1024×768 (H×W)** on person crop (OpenCV detect) or full frame; EXR at plate size |
 | **Python / torch** | 3.10+, torch 2.x | **≥3.12**, **torch ≥2.7** |
 
 Use SAP2 when plates are **people / live-action humans** and you want **matte + normal** without SAM3/BiRefNet. Keep LAOV matte for multi-object / non-human plates.
 
-## Drive layout (mirror VDA / LAOV)
+## I/O layout (VDA-style — same as depth lane)
+
+| Stage | Path |
+|-------|------|
+| **Plates (read)** | Drive: `plate_dir` in job JSON |
+| **Hot work** | Colab local: `/content/output/{shot}/` (JPEG cache, matte/normal EXR) — **same path as VDA** |
+| **Models** | Colab local: `/content/sapiens2_checkpoints` (Cell 3 download) |
+| **Deliverables (save)** | Drive: `MyDrive/VDA_output/{YYYYMMDD}/SAP2_output/{shot}/matte|normal/` |
+
+Resume checks **Drive** EXR counts; infer missing frames to **local** only; `shutil.copy2` to Drive **once when shot is done** (VDA `[SAVE]` block).
 
 ```
-MyDrive/
-├── VDA_Jobs/
-│   ├── code/{job_id}_cellcode.py      # uploaded from Desk
-│   └── {job_id}_config.json           # SAP2_STANDALONE batch
-├── VDA_models/
-│   └── sapiens2_host/
-│       ├── matting/sapiens2_1b_matting.safetensors
-│       └── normal/sapiens2_1b_normal.safetensors   # or 0.4b / 0.8b / 5b
-└── VDA_output/
-    └── {YYYYMMDD}/
-        └── SAP2_output/
-            └── {shot_name}/
-                ├── _plate_jpeg_cache/plate_000001.jpg
-                ├── matte/           # alpha EXR (Nuke)
-                ├── normal/          # RGB normal EXR
-                ├── _vis_matting/    # optional QC PNGs from upstream vis
-                ├── _vis_normal/
-                └── qc_sap2.mp4      # optional side-by-side
+/content/output/{shot}/               # ephemeral — same as VDA LOCAL_OUTPUT_PATH
+├── _plate_jpeg_cache/
+├── matte/
+└── normal/
+
+MyDrive/VDA_output/{date}/SAP2_output/{shot}/   # persistent
+├── matte/
+└── normal/
 ```
 
 ## Batch JSON (`model_type`: `SAP2_STANDALONE`)

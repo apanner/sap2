@@ -85,6 +85,11 @@ def process_shot(job: dict) -> bool:
         model_key=model_key,
         device=device,
         inference_long_edge=long_edge,
+        use_person_crop=bool(shared.get("use_person_crop", True)),
+        person_crop_pad=float(shared.get("person_crop_pad", 0.18)),
+        person_crop_confidence=float(shared.get("person_crop_confidence", 0.4)),
+        person_crop_smooth=float(shared.get("person_crop_smooth", 0.72)),
+        person_crop_multi=bool(shared.get("person_crop_multi", True)),
     )
 
     try:

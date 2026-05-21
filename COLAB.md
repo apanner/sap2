@@ -42,7 +42,9 @@ python scripts/sap2_colab_run.py --job-json /content/sap2_config.json
 
 ## Outputs
 
-Per shot under `MyDrive/VDA_output/{date}/SAP2_output/{shot_name}/`:
+**Processing** writes to `/content/output/{shot}/` (same as VDA `LOCAL_OUTPUT_PATH`). Plates are read from Drive once into a local JPEG cache. Optional **person crop** (OpenCV MobileNet-SSD / HOG): detect → pad crop → Sapiens2 @ 1024×768 → paste matte/normal to full plate. **Drive copy happens only when the shot is done** (`[SAVE] Saving results to Drive...`).
+
+Per shot deliverables under `MyDrive/VDA_output/{date}/SAP2_output/{shot_name}/`:
 
 | Folder | Content |
 |--------|---------|
