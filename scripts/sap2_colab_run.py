@@ -479,6 +479,10 @@ def _run_orchestrated(job_path: Path) -> int:
             _log.info("--- %s / %s ---", shot, pn)
             rc = _spawn_subprocess(job_path, idx, pn)
             if rc != 0:
+                hint = ""
+                if rc < 0 or rc in (134, 139):
+                    hint = " (likely GPU crash/OOM — try inference_max_megapixels=1.2)"
+                _log.error("Subprocess exit code %s%s", rc, hint)
                 failures.append(f"{shot}:{pn}")
                 break
         if gap > 0:

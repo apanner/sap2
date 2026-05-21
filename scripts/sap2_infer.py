@@ -98,18 +98,11 @@ def _init_task_model(
         os.chdir(prev)
 
 
-def _autocast_ctx(device: str):
-    if device.startswith("cuda") and torch.cuda.is_available():
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-    from contextlib import nullcontext
-
-    return nullcontext()
-
-
 def _run_matting_frame(model: Any, image_bgr: np.ndarray, device: str) -> np.ndarray:
     data = model.pipeline(dict(img=image_bgr))
     data = model.data_preprocessor(data)
-    with torch.inference_mode(), _autocast_ctx(device):
+    # Match upstream vis_matting.py: float32, no autocast (bf16 mismatch crashes on some GPUs)
+    with torch.inference_mode():
         out = model(data["inputs"])
     out = F.interpolate(
         out.float(),
@@ -126,7 +119,7 @@ def _run_normal_frame(model: Any, image_bgr: np.ndarray, device: str) -> np.ndar
     data = model.data_preprocessor(data)
     inputs = data["inputs"]
     samples = data.get("data_samples")
-    with torch.inference_mode(), _autocast_ctx(device):
+    with torch.inference_mode():
         normal = model(inputs)
         normal = normal / torch.norm(normal, dim=1, keepdim=True).clamp(min=1e-8)
     if samples and "meta" in samples and "padding_size" in samples["meta"]:
