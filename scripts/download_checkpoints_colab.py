@@ -36,6 +36,26 @@ HF_REPOS = {
         "normal/sapiens2_5b_normal.safetensors",
         "sapiens2_5b_normal.safetensors",
     ),
+    "seg_1b": (
+        "facebook/sapiens2-seg-1b",
+        "seg/sapiens2_1b_seg.safetensors",
+        "sapiens2_1b_seg.safetensors",
+    ),
+    "seg_0.4b": (
+        "facebook/sapiens2-seg-0.4b",
+        "seg/sapiens2_0.4b_seg.safetensors",
+        "sapiens2_0.4b_seg.safetensors",
+    ),
+    "seg_0.8b": (
+        "facebook/sapiens2-seg-0.8b",
+        "seg/sapiens2_0.8b_seg.safetensors",
+        "sapiens2_0.8b_seg.safetensors",
+    ),
+    "seg_5b": (
+        "facebook/sapiens2-seg-5b",
+        "seg/sapiens2_5b_seg.safetensors",
+        "sapiens2_5b_seg.safetensors",
+    ),
 }
 
 
@@ -44,12 +64,21 @@ def which_for_job(
     sapiens_model: str = "1b",
     run_matting: bool = True,
     run_normal: bool = True,
+    matte_output_mode: str = "segmentation",
 ) -> list[str]:
     model = str(sapiens_model).lower().replace("sapiens2_", "")
     keys: list[str] = []
-    if run_matting:
+    mom = str(matte_output_mode or "segmentation").strip().lower()
+    need_seg = run_matting and mom in ("segmentation", "both")
+    need_alpha = run_matting and mom in ("alpha", "both")
+    if need_seg:
+        sk = f"seg_{model}"
+        if sk not in HF_REPOS:
+            raise ValueError(f"No seg checkpoint mapping for model {model}")
+        keys.append(sk)
+    if need_alpha:
         if model != "1b":
-            raise ValueError("Human matting requires sapiens_model=1b")
+            raise ValueError("Human matting alpha requires sapiens_model=1b")
         keys.append("matting_1b")
     if run_normal:
         nk = f"normal_{model}"
@@ -84,6 +113,7 @@ def ensure_checkpoints(
     sapiens_model: str = "1b",
     run_matting: bool = True,
     run_normal: bool = True,
+    matte_output_mode: str = "segmentation",
 ) -> Path:
     """Download missing weights before inference. Returns checkpoint root path."""
     ckpt_root = Path(root or COLAB_CHECKPOINT_ROOT)
@@ -91,6 +121,7 @@ def ensure_checkpoints(
         sapiens_model=sapiens_model,
         run_matting=run_matting,
         run_normal=run_normal,
+        matte_output_mode=matte_output_mode,
     )
     download_checkpoints(ckpt_root, which)
     return ckpt_root

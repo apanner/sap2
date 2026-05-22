@@ -154,6 +154,22 @@ def write_matte_exr(path: Path, matte_rgba: np.ndarray) -> None:
         write_matte_alpha_exr(path, matte_rgba)
 
 
+def write_seg_color_exr(path: Path, color_rgb: np.ndarray) -> None:
+    """Body-part segmentation color map (RGB), official dome29 palette."""
+    rgb = np.clip(_to_float32_c(color_rgb), 0.0, 1.0)
+    if rgb.ndim != 3 or rgb.shape[-1] != 3:
+        raise ValueError(f"seg color must be HxWx3 RGB, got {rgb.shape}")
+    write_exr_float(path, rgb, channels=3, channel_names=("R", "G", "B"))
+
+
+def write_seg_id_exr(path: Path, label_map: np.ndarray) -> None:
+    """Per-pixel class index 0–28 (background=0) as float channel Z."""
+    ids = np.asarray(label_map, dtype=np.float32)
+    if ids.ndim != 2:
+        raise ValueError(f"label_map must be HxW, got {ids.shape}")
+    write_exr_float(path, ids, channels=1, channel_names=("Z",))
+
+
 def write_matte_subject_channels_exr(
     path: Path,
     subject_rgba: list[np.ndarray],

@@ -7,7 +7,7 @@
 
 | | LAOV AI Matte | SAP2 (Sapiens2) |
 |---|---------------|-----------------|
-| **Matte** | SAM3 track → BiRefNet / ViTMatte refine | Single **human matting** head (`sapiens2_1b_matting`) |
+| **Matte** | SAM3 track → BiRefNet / ViTMatte refine | **Body-part SEG** (29 classes, colorful) or optional **human matting** alpha |
 | **Normals** | — | **Surface normals** (`sapiens2_*_normal`) |
 | **Input** | Any foreground (text prompts) | **Human-centric** (people in frame) |
 | **Native infer res** | Full-res refine optional | **1024×768 (H×W)** internal; **EXR at full plate size** |
@@ -79,8 +79,9 @@ Set `"qc_mp4": false` in JSON to skip. `"qc_fps": 24` optional. **`qc_max_long_e
 
 Writes use **`ImageOutput.write_image`** + zip compression (same as LAOV `oiio_io.write_exr`), not `ImageBuf.set_pixels` (that path produced **black/empty EXRs**).
 
-- **Matte (official):** **`matte_%06d.exr`** = single **A** channel alpha in [0,1] (same data as Sapiens2 `_alpha.npy`; repo does not ship EXR)
-- **Matte (optional):** **`matte_premult_%06d.exr`** = premult **R,G,B,A** from model head (vis_matting composite)
+- **Matte default (`matte_output_mode: segmentation`):** **`matte_%06d.exr`** = **RGB color body-part map** (official [SEG](https://github.com/facebookresearch/sapiens2/blob/main/docs/SEG.md) dome29 palette — hair red, face blue, torso green, etc.)
+- **Matte ID (optional):** **`matte_id_%06d.exr`** = class index 0–28 per pixel (channel **Z**)
+- **Alpha matte (`matte_output_mode: alpha|both`):** **`matte_alpha_%06d.exr`** = single **A** channel (human matting head, not segmentation)
 - **Normal:** unit **R,G,B** in [-1, 1] (like LAOV `n.x` / `n.y` / `n.z`)
 
 After `git pull`, re-run Cell 3 — empty old EXRs are **auto re-exported** (detected via read-back).
@@ -108,8 +109,9 @@ Desk / manual JSON (same shape as LAOV batch):
     "run_matting": true,
     "run_normal": true,
     "image_feed_mode": "auto",
+    "matte_output_mode": "segmentation",
     "matte_image_feed_mode": "full_res",
-    "export_matte_premult_exr": true,
+    "export_matte_seg_id_exr": true,
     "use_person_crop": true,
     "person_crop_pad": 0.22,
     "person_crop_mode": "union",

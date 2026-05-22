@@ -25,6 +25,8 @@ from exr_io import (  # noqa: E402
     write_matte_premult_exr,
     write_matte_subject_channels_exr,
     write_normal_exr,
+    write_seg_color_exr,
+    write_seg_id_exr,
 )
 from plate_cache import build_plate_jpeg_cache, cache_path, plate_cache_complete  # noqa: E402
 from sap2_infer import MODEL_NATIVE_H, MODEL_NATIVE_W, Sap2ShotProcessor  # noqa: E402
@@ -102,40 +104,36 @@ def process_shot(job: dict) -> bool:
         person_crop_mode=str(shared.get("person_crop_mode") or "union"),
         matte_subject_layout=str(shared.get("matte_subject_layout") or "combined"),
         matte_max_subjects=int(shared.get("matte_max_subjects", 4)),
+        matte_output_mode=str(shared.get("matte_output_mode") or "segmentation"),
     )
+
+    matte_mode = str(shared.get("matte_output_mode") or "segmentation").strip().lower()
+    run_seg = run_matting and matte_mode in ("segmentation", "both")
+    run_alpha = run_matting and matte_mode in ("alpha", "both")
 
     try:
         if run_matting:
             matte_dir.mkdir(parents=True, exist_ok=True)
             matte_layout = str(shared.get("matte_subject_layout") or "combined").strip().lower()
             for fi in range(frame_start, frame_end + 1):
-                if matte_layout == "combined":
-                    exr_out = matte_dir / f"matte_{fi:06d}.exr"
-                    if exr_out.is_file():
-                        continue
+                exr_out = matte_dir / f"matte_{fi:06d}.exr"
+                if exr_out.is_file():
+                    continue
+                if run_seg:
+                    labels, color = proc.process_frame_segmentation(cache_path(cache_dir, fi))
+                    write_seg_color_exr(exr_out, color)
+                    if bool(shared.get("export_matte_seg_id_exr", True)):
+                        write_seg_id_exr(matte_dir / f"matte_id_{fi:06d}.exr", labels)
+                if run_alpha:
                     matte = proc.process_frame_matting(cache_path(cache_dir, fi))
-                    write_matte_alpha_exr(exr_out, matte)
-                    if bool(shared.get("export_matte_premult_exr", True)):
+                    alpha_path = exr_out if not run_seg else matte_dir / f"matte_alpha_{fi:06d}.exr"
+                    write_matte_alpha_exr(alpha_path, matte)
+                    if bool(shared.get("export_matte_premult_exr", False)):
                         write_matte_premult_exr(
                             matte_dir / f"matte_premult_{fi:06d}.exr", matte
                         )
-                elif matte_layout == "channels":
-                    exr_out = matte_dir / f"matte_{fi:06d}.exr"
-                    if exr_out.is_file():
-                        continue
-                    subjects = proc.process_frame_matting_subjects(cache_path(cache_dir, fi))
-                    write_matte_subject_channels_exr(exr_out, subjects)
-                else:
-                    subjects = proc.process_frame_matting_subjects(cache_path(cache_dir, fi))
-                    for si, subj in enumerate(subjects):
-                        sub_dir = matte_dir / f"p{si:02d}"
-                        sub_dir.mkdir(parents=True, exist_ok=True)
-                        exr_out = sub_dir / f"matte_{fi:06d}.exr"
-                        if exr_out.is_file():
-                            continue
-                        write_matte_exr(exr_out, subj)
                 if (fi - frame_start) % 25 == 0:
-                    _log.info("Matting %d/%d", fi - frame_start + 1, n_frames)
+                    _log.info("Matte %d/%d", fi - frame_start + 1, n_frames)
 
         if run_normal:
             normal_dir.mkdir(parents=True, exist_ok=True)

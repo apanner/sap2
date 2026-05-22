@@ -155,6 +155,38 @@ def _official_matte_composite_rgb(
     return np.clip(comp_bgr[:, :, ::-1], 0.0, 1.0)
 
 
+def _matte_seg_rgb(pixels: np.ndarray, names: tuple[str, ...]) -> np.ndarray | None:
+    """RGB body-part color map (official SEG palette)."""
+    r = _channel_plane(pixels, names, "R")
+    g = _channel_plane(pixels, names, "G")
+    b = _channel_plane(pixels, names, "B")
+    if r is None or g is None or b is None:
+        return None
+    rgb = np.stack([r, g, b], axis=-1)
+    if float(np.max(rgb)) < 1e-4:
+        return None
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def _matte_display_rgb(
+    exr_path: Path,
+    pixels: np.ndarray,
+    names: tuple[str, ...],
+    plate_cache_dir: Path | None,
+    frame_idx: int,
+    *,
+    matte_output_mode: str,
+) -> np.ndarray | None:
+    mode = str(matte_output_mode or "segmentation").strip().lower()
+    if mode in ("segmentation", "both") and pixels.shape[-1] >= 3:
+        seg_rgb = _matte_seg_rgb(pixels, names)
+        if seg_rgb is not None:
+            return seg_rgb
+    if mode in ("alpha", "both"):
+        return _matte_official_vis(exr_path, plate_cache_dir, frame_idx)
+    return _matte_seg_rgb(pixels, names)
+
+
 def _matte_official_vis(
     exr_path: Path,
     plate_cache_dir: Path | None,
@@ -231,13 +263,17 @@ def _export_stage_mp4(
     plate_cache_dir: Path | None,
     fps: float,
     max_long: int,
+    matte_output_mode: str = "segmentation",
 ) -> Path | None:
     entries = _sorted_exrs(stage_dir)
     if not entries:
         return None
 
     frames_rgb: list[np.ndarray] = []
-    use_overlay = vis_kind != "normal"
+    use_overlay = vis_kind != "normal" and str(matte_output_mode).lower() not in (
+        "segmentation",
+        "both",
+    )
     for frame_idx, exr_path in entries:
         pixels, names = read_exr_pixels(exr_path)
         if vis_kind == "matte_combined":
@@ -247,7 +283,10 @@ def _export_stage_mp4(
         elif vis_kind == "normal":
             rgb = _normal_display_rgb(pixels, names)
         else:
-            rgb = _matte_official_vis(exr_path, plate_cache_dir, frame_idx)
+            rgb = _matte_display_rgb(
+                exr_path, pixels, names, plate_cache_dir, frame_idx,
+                matte_output_mode=matte_output_mode,
+            )
         if rgb is None:
             continue
         frames_rgb.append(
@@ -276,6 +315,7 @@ def _export_review_mp4(
     *,
     plate_cache_dir: Path | None,
     matte_layout: str,
+    matte_output_mode: str,
     fps: float,
     max_long: int,
 ) -> Path | None:
@@ -302,20 +342,23 @@ def _export_review_mp4(
                 if sub.is_dir() and _SUBJECT_DIR_RE.match(sub.name):
                     exr_map = dict(_sorted_exrs(sub))
                     if frame_idx in exr_map:
-                        matte_rgb = _matte_official_vis(
-                            exr_map[frame_idx], plate_cache_dir, frame_idx
+                        px, names = read_exr_pixels(exr_map[frame_idx])
+                        matte_rgb = _matte_display_rgb(
+                            exr_map[frame_idx], px, names, plate_cache_dir, frame_idx,
+                            matte_output_mode=matte_output_mode,
                         )
                         break
         else:
             exr_map = dict(_sorted_exrs(matte_dir))
             if frame_idx in exr_map:
                 exr_path = exr_map[frame_idx]
+                px, names = read_exr_pixels(exr_path)
                 if matte_layout == "channels":
-                    px, names = read_exr_pixels(exr_path)
-                    matte_rgb = _matte_channels_rgb(px, names)
+                    matte_rgb = _matte_seg_rgb(px, names) or _matte_channels_rgb(px, names)
                 else:
-                    matte_rgb = _matte_official_vis(
-                        exr_path, plate_cache_dir, frame_idx
+                    matte_rgb = _matte_display_rgb(
+                        exr_path, px, names, plate_cache_dir, frame_idx,
+                        matte_output_mode=matte_output_mode,
                     )
 
         ref = plate if plate is not None else norm_rgb
@@ -377,6 +420,7 @@ def export_sap2_qc_mp4s(
     frame_end: int | None = None,
     fps: float = 24.0,
     matte_subject_layout: str = "combined",
+    matte_output_mode: str = "segmentation",
     export_matte: bool = True,
     export_normal: bool = True,
     include_review: bool = True,
@@ -391,7 +435,12 @@ def export_sap2_qc_mp4s(
     written: dict[str, Path] = {}
     _log.info("QC encode: max long edge %d px (HD proxy)", max_long)
 
-    stage_kw = dict(plate_cache_dir=plate_cache_dir, fps=fps, max_long=max_long)
+    stage_kw = dict(
+        plate_cache_dir=plate_cache_dir,
+        fps=fps,
+        max_long=max_long,
+        matte_output_mode=matte_output_mode,
+    )
 
     if export_matte:
         matte_dir = output_shot_dir / "matte"
@@ -446,6 +495,7 @@ def export_sap2_qc_mp4s(
                 shot_label,
                 plate_cache_dir=plate_cache_dir,
                 matte_layout=layout,
+                matte_output_mode=matte_output_mode,
                 fps=fps,
                 max_long=max_long,
             )

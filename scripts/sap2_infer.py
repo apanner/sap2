@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, List, Literal
 
 MatteSubjectLayout = Literal["combined", "channels", "separate"]
+MatteOutputMode = Literal["segmentation", "alpha", "both"]
 
 import cv2
 import numpy as np
@@ -142,6 +143,34 @@ def _run_matting_on_bgr(model: Any, image_bgr: np.ndarray) -> np.ndarray:
     return rgba
 
 
+def _run_seg_on_bgr(model: Any, image_bgr: np.ndarray) -> np.ndarray:
+    """Official vis_seg: argmax class labels H×W uint8 (29 classes)."""
+    out_h, out_w = image_bgr.shape[:2]
+    data = model.pipeline(dict(img=image_bgr))
+    data = model.data_preprocessor(data)
+    inputs = data["inputs"]
+    with torch.no_grad():
+        seg_logits = model(inputs)
+    seg_logits = F.interpolate(
+        seg_logits.float(),
+        size=(out_h, out_w),
+        mode="bilinear",
+        align_corners=False,
+    )
+    pred = seg_logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+    if not getattr(_run_seg_on_bgr, "_logged_once", False):
+        _run_seg_on_bgr._logged_once = True  # type: ignore[attr-defined]
+        fg = int((pred > 0).sum())
+        _log.info(
+            "Seg infer stats: fg_pixels=%d unique_classes=%d max_id=%d",
+            fg,
+            len(np.unique(pred)),
+            int(pred.max()),
+        )
+    del data, inputs, seg_logits
+    return np.ascontiguousarray(pred)
+
+
 def _run_normal_on_bgr(model: Any, image_bgr: np.ndarray) -> np.ndarray:
     out_h, out_w = image_bgr.shape[:2]
     data = model.pipeline(dict(img=image_bgr))
@@ -202,6 +231,7 @@ class Sap2ShotProcessor:
         matte_subject_layout: MatteSubjectLayout = "combined",
         matte_max_subjects: int = 4,
         matte_image_feed_mode: ImageFeedMode = "full_res",
+        matte_output_mode: MatteOutputMode = "segmentation",
     ):
         self.dense_root = Path(dense_root)
         self.ckpt_root = Path(ckpt_root)
@@ -228,7 +258,12 @@ class Sap2ShotProcessor:
         if mfeed not in ("auto", "full_res", "person_crop"):
             mfeed = "full_res"
         self.matte_image_feed_mode: ImageFeedMode = mfeed  # type: ignore[assignment]
+        mom = str(matte_output_mode or "segmentation").strip().lower()
+        if mom not in ("segmentation", "alpha", "both"):
+            mom = "segmentation"
+        self.matte_output_mode: MatteOutputMode = mom  # type: ignore[assignment]
         self._matting_model = None
+        self._seg_model = None
         self._normal_model = None
         self._crop_tracker = None
         self._plate_logged = False
@@ -291,6 +326,23 @@ class Sap2ShotProcessor:
             is_matting=True,
         )
         _log.info("Matting model ready (native %d×%d internal)", MODEL_NATIVE_H, MODEL_NATIVE_W)
+
+    def _ensure_seg(self) -> None:
+        if self._seg_model is not None:
+            return
+        cfg_path = self._cfg.get("seg_config") or ""
+        ckpt = self.ckpt_root / (self._cfg.get("seg_ckpt") or "")
+        if not cfg_path or not ckpt.is_file():
+            raise FileNotFoundError(f"Missing seg ckpt/config: {ckpt}")
+        _cuda_sync_cleanup()
+        self._seg_model = _init_task_model(
+            self.dense_root,
+            cfg_path,
+            ckpt,
+            self.device,
+            is_matting=False,
+        )
+        _log.info("Segmentation model ready (29-class body parts, %d×%d)", MODEL_NATIVE_H, MODEL_NATIVE_W)
 
     def _ensure_normal(self) -> None:
         if self._normal_model is not None:
@@ -386,6 +438,41 @@ class Sap2ShotProcessor:
             return tracker.paste_normal(h, w, normals[0], boxes[0])
         return tracker.merge_normals(h, w, normals, boxes)
 
+    def process_frame_segmentation(self, jpeg_path: Path) -> tuple[np.ndarray, np.ndarray]:
+        """Returns (label_map H×W uint8, color_rgb H×W×3 float)."""
+        from seg_export import labels_to_color_rgb
+
+        img = self._read_bgr(jpeg_path)
+        try:
+            self._ensure_seg()
+            assert self._seg_model is not None
+            labels = _run_seg_on_bgr(self._seg_model, img)
+            color = labels_to_color_rgb(labels)
+            return labels, color
+        finally:
+            _cuda_sync_cleanup()
+
+    def process_frame_segmentation_subjects(
+        self, jpeg_path: Path
+    ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
+        """Full-plate seg + per-person binary masks from label map + bboxes."""
+        from seg_export import labels_to_color_rgb, split_person_seg_masks
+
+        img = self._read_bgr(jpeg_path)
+        try:
+            self._ensure_seg()
+            assert self._seg_model is not None
+            labels = _run_seg_on_bgr(self._seg_model, img)
+            color = labels_to_color_rgb(labels)
+            tracker = self._crop_tracker_lazy()
+            _, boxes, _ = tracker.crop_regions_per_subject(img, max_subjects=self.matte_max_subjects)
+            masks = split_person_seg_masks(labels, boxes, max_subjects=self.matte_max_subjects)
+            if not masks:
+                masks = [(labels > 0).astype(np.float32)]
+            return labels, color, masks
+        finally:
+            _cuda_sync_cleanup()
+
     def process_frame_matting(self, jpeg_path: Path) -> np.ndarray:
         img = self._read_bgr(jpeg_path)
         try:
@@ -410,7 +497,7 @@ class Sap2ShotProcessor:
             _cuda_sync_cleanup()
 
     def unload(self) -> None:
-        for attr in ("_matting_model", "_normal_model"):
+        for attr in ("_matting_model", "_seg_model", "_normal_model"):
             m = getattr(self, attr, None)
             if m is not None:
                 del m

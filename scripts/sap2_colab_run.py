@@ -31,7 +31,11 @@ from exr_io import (  # noqa: E402
     write_matte_premult_exr,
     write_matte_subject_channels_exr,
     write_normal_exr,
+    write_exr_float,
+    write_seg_color_exr,
+    write_seg_id_exr,
 )
+from seg_export import pack_subject_alpha_channels  # noqa: E402
 from plate_cache import build_plate_jpeg_cache, cache_path, plate_cache_complete, pattern_to_path  # noqa: E402
 
 _log = logging.getLogger("sap2_colab_run")
@@ -54,8 +58,10 @@ SAP2_DEFAULTS: dict[str, Any] = {
     "batch_one_process_per_shot": True,
     "split_pass_subprocess": False,
     "image_feed_mode": "auto",
+    "matte_output_mode": "segmentation",
     "matte_image_feed_mode": "full_res",
-    "export_matte_premult_exr": True,
+    "export_matte_seg_id_exr": True,
+    "export_matte_premult_exr": False,
     "batch_gap_seconds": 5,
     "checkpoint_root": "",
     "download_models_in_colab": True,
@@ -178,6 +184,7 @@ def _ensure_models_if_needed(
         sapiens_model=str(shared.get("sapiens_model", "1b")),
         run_matting=run_matting,
         run_normal=run_normal,
+        matte_output_mode=str(shared.get("matte_output_mode", "segmentation")),
     )
 
 
@@ -204,7 +211,21 @@ def _exr_is_empty(path: Path) -> bool:
 
 
 def _is_primary_matte_exr(path: Path) -> bool:
+    n = path.name.lower()
+    if "premult" in n or "seg_id" in n or n.startswith("matte_id"):
+        return False
     return bool(re.match(r"^matte_\d+\.exr$", path.name, re.IGNORECASE))
+
+
+def _resolve_matte_modes(shared: dict[str, Any]) -> tuple[str, bool, bool]:
+    """Returns (layout, run_segmentation, run_alpha)."""
+    mode = str(shared.get("matte_output_mode") or "segmentation").strip().lower()
+    if mode not in ("segmentation", "alpha", "both"):
+        mode = "segmentation"
+    layout = str(shared.get("matte_subject_layout") or "combined").strip().lower()
+    if layout not in ("combined", "channels", "separate"):
+        layout = "combined"
+    return layout, mode in ("segmentation", "both"), mode in ("alpha", "both")
 
 
 def _exr_count(folder: Path, *, recursive: bool = False, matte_primary_only: bool = False) -> int:
@@ -394,9 +415,11 @@ def _run_shot(
     matte_feed = str(shared.get("matte_image_feed_mode") or "full_res").strip().lower()
     if matte_feed not in ("auto", "full_res", "person_crop"):
         matte_feed = "full_res"
+    matte_out_mode = str(shared.get("matte_output_mode") or "segmentation").strip().lower()
     proc_kw = dict(
         image_feed_mode=feed_mode,
         matte_image_feed_mode=matte_feed,
+        matte_output_mode=matte_out_mode,
         use_person_crop=bool(shared.get("use_person_crop", True)),
         person_crop_pad=float(shared.get("person_crop_pad", 0.22)),
         person_crop_confidence=float(shared.get("person_crop_confidence", 0.28)),
@@ -437,60 +460,125 @@ def _run_shot(
 
     try:
         if run_matting and not matte_done:
-            ckpt = ckpt_root / cfg["matting_ckpt"]
-            if not ckpt.is_file():
-                raise FileNotFoundError(f"Missing matting ckpt: {ckpt}")
+            matte_layout, run_seg, run_alpha = _resolve_matte_modes(shared)
+            if run_seg:
+                seg_ckpt = ckpt_root / cfg.get("seg_ckpt", "")
+                if not seg_ckpt.is_file():
+                    raise FileNotFoundError(
+                        f"Missing seg ckpt for body-part matte: {seg_ckpt}"
+                    )
+            if run_alpha:
+                ckpt = ckpt_root / cfg["matting_ckpt"]
+                if not ckpt.is_file():
+                    raise FileNotFoundError(f"Missing matting ckpt: {ckpt}")
             matte_local.mkdir(parents=True, exist_ok=True)
             assert proc is not None
-            matte_layout = str(shared.get("matte_subject_layout") or "combined").strip().lower()
-            if matte_layout not in ("combined", "channels", "separate"):
-                matte_layout = "combined"
-            _log.info("Matte subject layout: %s", matte_layout)
+            _log.info(
+                "Matte pass: mode=%s layout=%s (seg=%s alpha=%s)",
+                matte_out_mode,
+                matte_layout,
+                run_seg,
+                run_alpha,
+            )
             done = 0
             verified_matte = False
             for fi in range(frame_start, frame_end + 1):
-                if matte_layout == "combined":
-                    exr_out = matte_local / f"matte_{fi:06d}.exr"
-                    if exr_out.is_file() and not _exr_is_empty(exr_out):
-                        done += 1
-                        continue
-                    if exr_out.is_file():
-                        _log.warning("Re-export empty matte EXR: %s", exr_out.name)
-                    matte = proc.process_frame_matting(cache_path(cache_dir, fi))
-                    write_matte_alpha_exr(exr_out, matte)
-                    if bool(shared.get("export_matte_premult_exr", True)):
-                        write_matte_premult_exr(
-                            matte_local / f"matte_premult_{fi:06d}.exr", matte
+                exr_out = matte_local / f"matte_{fi:06d}.exr"
+                if exr_out.is_file() and not _exr_is_empty(exr_out):
+                    done += 1
+                    continue
+                if exr_out.is_file():
+                    _log.warning("Re-export empty matte EXR: %s", exr_out.name)
+
+                if run_seg:
+                    if matte_layout == "channels":
+                        labels, color, person_masks = proc.process_frame_segmentation_subjects(
+                            cache_path(cache_dir, fi)
                         )
-                    if not verified_matte:
-                        verify_exr_nonzero(exr_out, label="matte_alpha")
-                        verified_matte = True
-                elif matte_layout == "channels":
-                    exr_out = matte_local / f"matte_{fi:06d}.exr"
-                    if exr_out.is_file() and not _exr_is_empty(exr_out):
-                        done += 1
-                        continue
-                    subjects = proc.process_frame_matting_subjects(
-                        cache_path(cache_dir, fi)
-                    )
-                    write_matte_subject_channels_exr(exr_out, subjects)
-                    if not verified_matte:
-                        verify_exr_nonzero(exr_out, label="matte_ch")
-                        verified_matte = True
-                else:
-                    subjects = proc.process_frame_matting_subjects(
-                        cache_path(cache_dir, fi)
-                    )
-                    for si, subj in enumerate(subjects):
-                        sub_dir = matte_local / f"p{si:02d}"
-                        sub_dir.mkdir(parents=True, exist_ok=True)
-                        exr_out = sub_dir / f"matte_{fi:06d}.exr"
-                        if exr_out.is_file() and not _exr_is_empty(exr_out):
-                            continue
-                        write_matte_exr(exr_out, subj)
-                        if not verified_matte:
-                            verify_exr_nonzero(exr_out, label=f"matte_{si:02d}")
-                            verified_matte = True
+                        write_seg_color_exr(exr_out, color)
+                        if person_masks:
+                            packed, ch_names = pack_subject_alpha_channels(person_masks)
+                            write_exr_float(
+                                matte_local / f"matte_people_{fi:06d}.exr",
+                                packed,
+                                channels=packed.shape[-1],
+                                channel_names=ch_names,
+                            )
+                        if bool(shared.get("export_matte_seg_id_exr", True)):
+                            write_seg_id_exr(
+                                matte_local / f"matte_id_{fi:06d}.exr", labels
+                            )
+                    elif matte_layout == "separate":
+                        labels, color, person_masks = proc.process_frame_segmentation_subjects(
+                            cache_path(cache_dir, fi)
+                        )
+                        write_seg_color_exr(exr_out, color)
+                        for si, mask in enumerate(person_masks):
+                            sub_dir = matte_local / f"p{si:02d}"
+                            sub_dir.mkdir(parents=True, exist_ok=True)
+                            write_matte_alpha_exr(sub_dir / f"matte_{fi:06d}.exr", mask)
+                        if bool(shared.get("export_matte_seg_id_exr", True)):
+                            write_seg_id_exr(
+                                matte_local / f"matte_id_{fi:06d}.exr", labels
+                            )
+                    else:
+                        labels, color = proc.process_frame_segmentation(
+                            cache_path(cache_dir, fi)
+                        )
+                        write_seg_color_exr(exr_out, color)
+                        if bool(shared.get("export_matte_seg_id_exr", True)):
+                            write_seg_id_exr(
+                                matte_local / f"matte_id_{fi:06d}.exr", labels
+                            )
+
+                if run_alpha:
+                    alpha_path = matte_local / f"matte_alpha_{fi:06d}.exr"
+                    if matte_layout == "combined":
+                        matte = proc.process_frame_matting(cache_path(cache_dir, fi))
+                        if not run_seg:
+                            write_matte_alpha_exr(exr_out, matte)
+                        else:
+                            write_matte_alpha_exr(alpha_path, matte)
+                        if bool(shared.get("export_matte_premult_exr", False)):
+                            write_matte_premult_exr(
+                                matte_local / f"matte_premult_{fi:06d}.exr", matte
+                            )
+                    elif matte_layout == "channels":
+                        subjects = proc.process_frame_matting_subjects(
+                            cache_path(cache_dir, fi)
+                        )
+                        if not run_seg:
+                            write_matte_subject_channels_exr(exr_out, subjects)
+                        else:
+                            packed = np.zeros(
+                                (
+                                    subjects[0].shape[0],
+                                    subjects[0].shape[1],
+                                    4,
+                                ),
+                                dtype=np.float32,
+                            )
+                            for i, subj in enumerate(subjects[:4]):
+                                a = subj[:, :, 3] if subj.shape[-1] == 4 else subj
+                                packed[:, :, i] = np.clip(a, 0.0, 1.0)
+                            write_exr_float(
+                                alpha_path,
+                                packed,
+                                channels=4,
+                                channel_names=("R", "G", "B", "A"),
+                            )
+                    else:
+                        subjects = proc.process_frame_matting_subjects(
+                            cache_path(cache_dir, fi)
+                        )
+                        for si, subj in enumerate(subjects):
+                            sub_dir = matte_local / f"p{si:02d}"
+                            sub_dir.mkdir(parents=True, exist_ok=True)
+                            write_matte_exr(sub_dir / f"matte_{fi:06d}.exr", subj)
+
+                if not verified_matte:
+                    verify_exr_nonzero(exr_out, label="matte")
+                    verified_matte = True
                 done += 1
                 if done == 1 or done % 10 == 0 or done == n_frames:
                     _log.info("Matte → local %d/%d", done, n_frames)
@@ -548,6 +636,7 @@ def _run_shot(
                 frame_end=frame_end,
                 fps=fps,
                 matte_subject_layout=matte_layout,
+                matte_output_mode=str(shared.get("matte_output_mode", "segmentation")),
                 export_matte=export_matte and run_matting,
                 export_normal=export_normal and run_normal,
                 qc_max_long_edge=int(shared.get("qc_max_long_edge", 1920)),
