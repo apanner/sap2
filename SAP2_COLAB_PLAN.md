@@ -79,10 +79,25 @@ Set `"qc_mp4": false` in JSON to skip. `"qc_fps": 24` optional. **`qc_max_long_e
 
 Writes use **`ImageOutput.write_image`** + zip compression (same as LAOV `oiio_io.write_exr`), not `ImageBuf.set_pixels` (that path produced **black/empty EXRs**).
 
-- **Matte default (`matte_output_mode: segmentation`):** **`matte_%06d.exr`** = **RGB color body-part map** (official [SEG](https://github.com/facebookresearch/sapiens2/blob/main/docs/SEG.md) dome29 palette — hair red, face blue, torso green, etc.)
-- **Matte ID (optional):** **`matte_id_%06d.exr`** = class index 0–28 per pixel (channel **Z**)
-- **Alpha matte (`matte_output_mode: alpha|both`):** **`matte_alpha_%06d.exr`** = single **A** channel (human matting head, not segmentation)
-- **Normal:** unit **R,G,B** in [-1, 1] (like LAOV `n.x` / `n.y` / `n.z`)
+- **Matte default (`matte_output_mode: segmentation`):**
+  - **`matte_%06d.exr`** — **RGBA**: RGB = body-part colors, **A = combined human alpha** (bw comp mask, both people)
+  - **`matte_alpha_%06d.exr`** — **A only** (same bw mask, for simple Read → Merge)
+  - **`matte_id_%06d.exr`** — **class_id** (0–28 part index) + **A** (fg mask). **Not** depth.Z
+  - **`matte_people_%06d.exr`** — R,G,B,A = per-person silhouette (when 2+ people)
+- **Normal:** unit **R,G,B** in [-1, 1]
+
+### Nuke workflow (not Cryptomatte)
+
+This is **semantic body-part segmentation**, not Cryptomatte. Typical comp:
+
+| Goal | Node | Channel |
+|------|------|---------|
+| **Merge people over bg** | Read `matte_*.exr` or `matte_alpha_*.exr` | **alpha** |
+| **View part colors** | Read `matte_*.exr` | **rgb** |
+| **Mask one body part** | Read `matte_id_*.exr` → Grade/Expression | **class_id** == N (see [SEG class list](https://github.com/facebookresearch/sapiens2/blob/main/docs/SEG.md)) |
+| **Per person** | Read `matte_people_*.exr` | **R**=person0, **G**=person1, … |
+
+Example: hair mask → `class_id == 4` (Hair). Torso → `class_id == 22`.
 
 After `git pull`, re-run Cell 3 — empty old EXRs are **auto re-exported** (detected via read-back).
 
@@ -112,6 +127,7 @@ Desk / manual JSON (same shape as LAOV batch):
     "matte_output_mode": "segmentation",
     "matte_image_feed_mode": "full_res",
     "export_matte_seg_id_exr": true,
+    "export_matte_alpha_exr": true,
     "use_person_crop": true,
     "person_crop_pad": 0.22,
     "person_crop_mode": "union",

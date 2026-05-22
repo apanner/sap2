@@ -37,6 +37,12 @@ def labels_to_color_rgb(label_map: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(color_rgb)
 
 
+def labels_to_human_alpha(label_map: np.ndarray) -> np.ndarray:
+    """Combined human silhouette: 1 where any body part (class > 0), else 0."""
+    labels = np.asarray(label_map, dtype=np.int32)
+    return (labels > 0).astype(np.float32)
+
+
 def labels_to_overlay_bgr(image_bgr: np.ndarray, label_map: np.ndarray, *, opacity: float = 0.5) -> np.ndarray:
     """Plate + semi-transparent seg colors (demo / QC)."""
     import cv2

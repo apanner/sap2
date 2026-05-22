@@ -43,6 +43,17 @@ def _sorted_exrs(folder: Path) -> list[tuple[int, Path]]:
     return sorted(by_frame.items(), key=lambda x: x[0])
 
 
+def _sorted_prefixed_exrs(folder: Path, prefix: str) -> list[tuple[int, Path]]:
+    if not folder.is_dir():
+        return []
+    by_frame: dict[int, Path] = {}
+    for path in sorted(folder.glob(f"{prefix}_*.exr")):
+        m = _FRAME_RE.search(path.name)
+        if m:
+            by_frame[int(m.group(1))] = path
+    return sorted(by_frame.items(), key=lambda x: x[0])
+
+
 def _fit_long_edge_uint8(img: np.ndarray, max_long: int) -> np.ndarray:
     """Downscale for QC (HD): keep aspect, long edge <= max_long."""
     import cv2
@@ -168,6 +179,23 @@ def _matte_seg_rgb(pixels: np.ndarray, names: tuple[str, ...]) -> np.ndarray | N
     return np.clip(rgb, 0.0, 1.0)
 
 
+def _matte_alpha_from_pixels(pixels: np.ndarray, names: tuple[str, ...]) -> np.ndarray | None:
+    a = _channel_plane(pixels, names, "A")
+    if a is not None:
+        return np.clip(a, 0.0, 1.0)
+    if len(names) == 1:
+        return np.clip(pixels[..., 0], 0.0, 1.0)
+    return None
+
+
+def _matte_bw_rgb(pixels: np.ndarray, names: tuple[str, ...]) -> np.ndarray | None:
+    """Grayscale human alpha for QC."""
+    alpha = _matte_alpha_from_pixels(pixels, names)
+    if alpha is None:
+        return None
+    return np.stack([alpha, alpha, alpha], axis=-1)
+
+
 def _matte_display_rgb(
     exr_path: Path,
     pixels: np.ndarray,
@@ -264,20 +292,32 @@ def _export_stage_mp4(
     fps: float,
     max_long: int,
     matte_output_mode: str = "segmentation",
+    qc_matte_view: str = "seg",
 ) -> Path | None:
-    entries = _sorted_exrs(stage_dir)
+    if vis_kind == "matte_alpha":
+        entries = _sorted_prefixed_exrs(stage_dir, "matte_alpha")
+    else:
+        entries = _sorted_exrs(stage_dir)
     if not entries:
         return None
 
     frames_rgb: list[np.ndarray] = []
-    use_overlay = vis_kind != "normal" and str(matte_output_mode).lower() not in (
-        "segmentation",
-        "both",
+    use_overlay = (
+        vis_kind not in ("normal", "matte_alpha", "matte_combined")
+        and str(matte_output_mode).lower() not in ("segmentation", "both")
     )
     for frame_idx, exr_path in entries:
         pixels, names = read_exr_pixels(exr_path)
         if vis_kind == "matte_combined":
-            rgb = _matte_official_vis(exr_path, plate_cache_dir, frame_idx)
+            if qc_matte_view == "alpha":
+                rgb = _matte_bw_rgb(pixels, names)
+            else:
+                rgb = _matte_display_rgb(
+                    exr_path, pixels, names, plate_cache_dir, frame_idx,
+                    matte_output_mode=matte_output_mode,
+                )
+        elif vis_kind == "matte_alpha":
+            rgb = _matte_bw_rgb(pixels, names)
         elif vis_kind == "matte_channels":
             rgb = _matte_channels_rgb(pixels, names)
         elif vis_kind == "normal":
@@ -425,6 +465,7 @@ def export_sap2_qc_mp4s(
     export_normal: bool = True,
     include_review: bool = True,
     qc_max_long_edge: int = DEFAULT_QC_MAX_LONG_EDGE,
+    qc_matte_view: str = "seg",
 ) -> dict[str, Path]:
     """Write HD QC MP4s under ``<shot>/qc/`` (long edge capped at ``qc_max_long_edge``)."""
     output_shot_dir = Path(output_shot_dir)
@@ -440,6 +481,7 @@ def export_sap2_qc_mp4s(
         fps=fps,
         max_long=max_long,
         matte_output_mode=matte_output_mode,
+        qc_matte_view=qc_matte_view,
     )
 
     if export_matte:
@@ -472,6 +514,11 @@ def export_sap2_qc_mp4s(
                 )
                 if out:
                     written["matte"] = out
+                out_a = _export_stage_mp4(
+                    matte_dir, qc_dir, shot_label, "matte_alpha", "matte_alpha", **stage_kw
+                )
+                if out_a:
+                    written["matte_alpha"] = out_a
             except Exception as exc:
                 _log.warning("QC matte failed: %s", exc)
 

@@ -154,8 +154,24 @@ def write_matte_exr(path: Path, matte_rgba: np.ndarray) -> None:
         write_matte_alpha_exr(path, matte_rgba)
 
 
+def write_matte_seg_rgba_exr(
+    path: Path, color_rgb: np.ndarray, human_alpha: np.ndarray
+) -> None:
+    """
+    Primary Nuke matte: RGB = body-part colors, A = combined human alpha (bw comp mask).
+    """
+    rgb = np.clip(_to_float32_c(color_rgb), 0.0, 1.0)
+    a = np.clip(_to_float32_c(human_alpha), 0.0, 1.0)
+    if rgb.ndim != 3 or rgb.shape[-1] != 3:
+        raise ValueError(f"seg color must be HxWx3 RGB, got {rgb.shape}")
+    if a.ndim == 3:
+        a = a[..., 0]
+    rgba = np.dstack([rgb, a])
+    write_exr_float(path, rgba, channels=4, channel_names=("R", "G", "B", "A"))
+
+
 def write_seg_color_exr(path: Path, color_rgb: np.ndarray) -> None:
-    """Body-part segmentation color map (RGB), official dome29 palette."""
+    """Body-part segmentation color map only (RGB). Prefer write_matte_seg_rgba_exr for delivery."""
     rgb = np.clip(_to_float32_c(color_rgb), 0.0, 1.0)
     if rgb.ndim != 3 or rgb.shape[-1] != 3:
         raise ValueError(f"seg color must be HxWx3 RGB, got {rgb.shape}")
@@ -163,11 +179,15 @@ def write_seg_color_exr(path: Path, color_rgb: np.ndarray) -> None:
 
 
 def write_seg_id_exr(path: Path, label_map: np.ndarray) -> None:
-    """Per-pixel class index 0–28 (background=0) as float channel Z."""
-    ids = np.asarray(label_map, dtype=np.float32)
-    if ids.ndim != 2:
-        raise ValueError(f"label_map must be HxW, got {ids.shape}")
-    write_exr_float(path, ids, channels=1, channel_names=("Z",))
+    """
+    Per-pixel class index 0–28 + human alpha.
+    Channels: class_id, A — NOT depth.Z (Nuke maps Z → depth layer).
+    """
+    labels = np.asarray(label_map, dtype=np.int32)
+    ids = labels.astype(np.float32)
+    alpha = (labels > 0).astype(np.float32)
+    packed = np.dstack([ids, alpha])
+    write_exr_float(path, packed, channels=2, channel_names=("class_id", "A"))
 
 
 def write_matte_subject_channels_exr(

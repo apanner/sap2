@@ -29,13 +29,14 @@ from exr_io import (  # noqa: E402
     write_matte_alpha_exr,
     write_matte_exr,
     write_matte_premult_exr,
+    write_matte_seg_rgba_exr,
     write_matte_subject_channels_exr,
     write_normal_exr,
     write_exr_float,
     write_seg_color_exr,
     write_seg_id_exr,
 )
-from seg_export import pack_subject_alpha_channels  # noqa: E402
+from seg_export import labels_to_human_alpha, pack_subject_alpha_channels  # noqa: E402
 from plate_cache import build_plate_jpeg_cache, cache_path, plate_cache_complete, pattern_to_path  # noqa: E402
 
 _log = logging.getLogger("sap2_colab_run")
@@ -61,6 +62,7 @@ SAP2_DEFAULTS: dict[str, Any] = {
     "matte_output_mode": "segmentation",
     "matte_image_feed_mode": "full_res",
     "export_matte_seg_id_exr": True,
+    "export_matte_alpha_exr": True,
     "export_matte_premult_exr": False,
     "batch_gap_seconds": 5,
     "checkpoint_root": "",
@@ -208,6 +210,47 @@ def _exr_is_empty(path: Path) -> bool:
         return float(np.max(np.abs(arr))) < 1e-5
     except Exception:
         return True
+
+
+def _matte_exr_outdated(path: Path) -> bool:
+    """True if matte EXR is RGB-only (pre-alpha delivery) or old Z-only id file."""
+    if not path.is_file():
+        return True
+    try:
+        arr, names = read_exr_pixels(path)
+        if path.name.startswith("matte_id_"):
+            return "class_id" not in names and "Z" in names
+        if path.name.startswith("matte_") and "premult" not in path.name.lower():
+            return "A" not in names and arr.shape[-1] < 4
+        return False
+    except Exception:
+        return True
+
+
+def _write_seg_matte_bundle(
+    matte_local: Path,
+    fi: int,
+    labels: np.ndarray,
+    color: np.ndarray,
+    shared: dict[str, Any],
+    *,
+    exr_out: Path,
+    person_masks: list[np.ndarray] | None = None,
+) -> None:
+    human_alpha = labels_to_human_alpha(labels)
+    write_matte_seg_rgba_exr(exr_out, color, human_alpha)
+    if bool(shared.get("export_matte_alpha_exr", True)):
+        write_matte_alpha_exr(matte_local / f"matte_alpha_{fi:06d}.exr", human_alpha)
+    if bool(shared.get("export_matte_seg_id_exr", True)):
+        write_seg_id_exr(matte_local / f"matte_id_{fi:06d}.exr", labels)
+    if person_masks:
+        packed, ch_names = pack_subject_alpha_channels(person_masks)
+        write_exr_float(
+            matte_local / f"matte_people_{fi:06d}.exr",
+            packed,
+            channels=packed.shape[-1],
+            channel_names=ch_names,
+        )
 
 
 def _is_primary_matte_exr(path: Path) -> bool:
@@ -484,52 +527,54 @@ def _run_shot(
             verified_matte = False
             for fi in range(frame_start, frame_end + 1):
                 exr_out = matte_local / f"matte_{fi:06d}.exr"
-                if exr_out.is_file() and not _exr_is_empty(exr_out):
+                if (
+                    exr_out.is_file()
+                    and not _exr_is_empty(exr_out)
+                    and not _matte_exr_outdated(exr_out)
+                ):
                     done += 1
                     continue
                 if exr_out.is_file():
-                    _log.warning("Re-export empty matte EXR: %s", exr_out.name)
+                    _log.warning("Re-export matte EXR (missing alpha / old format): %s", exr_out.name)
 
                 if run_seg:
                     if matte_layout == "channels":
                         labels, color, person_masks = proc.process_frame_segmentation_subjects(
                             cache_path(cache_dir, fi)
                         )
-                        write_seg_color_exr(exr_out, color)
-                        if person_masks:
-                            packed, ch_names = pack_subject_alpha_channels(person_masks)
-                            write_exr_float(
-                                matte_local / f"matte_people_{fi:06d}.exr",
-                                packed,
-                                channels=packed.shape[-1],
-                                channel_names=ch_names,
-                            )
-                        if bool(shared.get("export_matte_seg_id_exr", True)):
-                            write_seg_id_exr(
-                                matte_local / f"matte_id_{fi:06d}.exr", labels
-                            )
+                        _write_seg_matte_bundle(
+                            matte_local,
+                            fi,
+                            labels,
+                            color,
+                            shared,
+                            exr_out=exr_out,
+                            person_masks=person_masks,
+                        )
                     elif matte_layout == "separate":
                         labels, color, person_masks = proc.process_frame_segmentation_subjects(
                             cache_path(cache_dir, fi)
                         )
-                        write_seg_color_exr(exr_out, color)
+                        _write_seg_matte_bundle(
+                            matte_local, fi, labels, color, shared, exr_out=exr_out
+                        )
                         for si, mask in enumerate(person_masks):
                             sub_dir = matte_local / f"p{si:02d}"
                             sub_dir.mkdir(parents=True, exist_ok=True)
                             write_matte_alpha_exr(sub_dir / f"matte_{fi:06d}.exr", mask)
-                        if bool(shared.get("export_matte_seg_id_exr", True)):
-                            write_seg_id_exr(
-                                matte_local / f"matte_id_{fi:06d}.exr", labels
-                            )
                     else:
-                        labels, color = proc.process_frame_segmentation(
+                        labels, color, person_masks = proc.process_frame_segmentation_subjects(
                             cache_path(cache_dir, fi)
                         )
-                        write_seg_color_exr(exr_out, color)
-                        if bool(shared.get("export_matte_seg_id_exr", True)):
-                            write_seg_id_exr(
-                                matte_local / f"matte_id_{fi:06d}.exr", labels
-                            )
+                        _write_seg_matte_bundle(
+                            matte_local,
+                            fi,
+                            labels,
+                            color,
+                            shared,
+                            exr_out=exr_out,
+                            person_masks=person_masks if len(person_masks) > 1 else None,
+                        )
 
                 if run_alpha:
                     alpha_path = matte_local / f"matte_alpha_{fi:06d}.exr"

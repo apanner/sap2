@@ -23,11 +23,11 @@ from exr_io import (  # noqa: E402
     write_matte_alpha_exr,
     write_matte_exr,
     write_matte_premult_exr,
-    write_matte_subject_channels_exr,
+    write_matte_seg_rgba_exr,
     write_normal_exr,
-    write_seg_color_exr,
     write_seg_id_exr,
 )
+from seg_export import labels_to_human_alpha  # noqa: E402
 from plate_cache import build_plate_jpeg_cache, cache_path, plate_cache_complete  # noqa: E402
 from sap2_infer import MODEL_NATIVE_H, MODEL_NATIVE_W, Sap2ShotProcessor  # noqa: E402
 
@@ -120,8 +120,15 @@ def process_shot(job: dict) -> bool:
                 if exr_out.is_file():
                     continue
                 if run_seg:
-                    labels, color = proc.process_frame_segmentation(cache_path(cache_dir, fi))
-                    write_seg_color_exr(exr_out, color)
+                    labels, color, _ = proc.process_frame_segmentation_subjects(
+                        cache_path(cache_dir, fi)
+                    )
+                    human_alpha = labels_to_human_alpha(labels)
+                    write_matte_seg_rgba_exr(exr_out, color, human_alpha)
+                    if bool(shared.get("export_matte_alpha_exr", True)):
+                        write_matte_alpha_exr(
+                            matte_dir / f"matte_alpha_{fi:06d}.exr", human_alpha
+                        )
                     if bool(shared.get("export_matte_seg_id_exr", True)):
                         write_seg_id_exr(matte_dir / f"matte_id_{fi:06d}.exr", labels)
                 if run_alpha:

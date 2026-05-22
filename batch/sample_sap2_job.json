@@ -8,6 +8,7 @@
     "export_matte_exr": true,
     "matte_output_mode": "segmentation",
     "export_matte_seg_id_exr": true,
+    "export_matte_alpha_exr": true,
     "export_matte_premult_exr": false,
     "matte_image_feed_mode": "full_res",
     "export_normal_exr": true,
