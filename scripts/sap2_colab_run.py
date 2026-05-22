@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,7 +26,9 @@ if str(_SCRIPTS) not in sys.path:
 from exr_io import (  # noqa: E402
     read_exr_pixels,
     verify_exr_nonzero,
+    write_matte_alpha_exr,
     write_matte_exr,
+    write_matte_premult_exr,
     write_matte_subject_channels_exr,
     write_normal_exr,
 )
@@ -51,6 +54,8 @@ SAP2_DEFAULTS: dict[str, Any] = {
     "batch_one_process_per_shot": True,
     "split_pass_subprocess": False,
     "image_feed_mode": "auto",
+    "matte_image_feed_mode": "full_res",
+    "export_matte_premult_exr": True,
     "batch_gap_seconds": 5,
     "checkpoint_root": "",
     "download_models_in_colab": True,
@@ -198,12 +203,20 @@ def _exr_is_empty(path: Path) -> bool:
         return True
 
 
-def _exr_count(folder: Path, *, recursive: bool = False) -> int:
+def _is_primary_matte_exr(path: Path) -> bool:
+    return bool(re.match(r"^matte_\d+\.exr$", path.name, re.IGNORECASE))
+
+
+def _exr_count(folder: Path, *, recursive: bool = False, matte_primary_only: bool = False) -> int:
     if not folder.is_dir():
         return 0
     if recursive:
-        return len(list(folder.rglob("*.exr")))
-    return len(list(folder.glob("*.exr")))
+        paths = folder.rglob("*.exr")
+    else:
+        paths = folder.glob("*.exr")
+    if matte_primary_only:
+        return sum(1 for p in paths if _is_primary_matte_exr(p))
+    return sum(1 for p in paths if "premult" not in p.stem.lower())
 
 
 def _matte_layout(shared: dict[str, Any]) -> str:
@@ -219,9 +232,11 @@ def _matte_complete(matte_dir: Path, n_frames: int, layout: str) -> bool:
             d for d in matte_dir.iterdir() if d.is_dir() and d.name.startswith("p")
         )
         if subdirs:
-            return any(_exr_count(d) >= n_frames for d in subdirs)
-        return _exr_count(matte_dir) >= n_frames
-    return _exr_count(matte_dir) >= n_frames
+            return any(
+                _exr_count(d, matte_primary_only=True) >= n_frames for d in subdirs
+            )
+        return _exr_count(matte_dir, matte_primary_only=True) >= n_frames
+    return _exr_count(matte_dir, matte_primary_only=True) >= n_frames
 
 
 def _pass_done_local_or_drive(
@@ -376,8 +391,12 @@ def _run_shot(
     feed_mode = str(shared.get("image_feed_mode") or "auto").strip().lower()
     if feed_mode not in ("auto", "full_res", "person_crop"):
         feed_mode = "auto"
+    matte_feed = str(shared.get("matte_image_feed_mode") or "full_res").strip().lower()
+    if matte_feed not in ("auto", "full_res", "person_crop"):
+        matte_feed = "full_res"
     proc_kw = dict(
         image_feed_mode=feed_mode,
+        matte_image_feed_mode=matte_feed,
         use_person_crop=bool(shared.get("use_person_crop", True)),
         person_crop_pad=float(shared.get("person_crop_pad", 0.22)),
         person_crop_confidence=float(shared.get("person_crop_confidence", 0.28)),
@@ -438,9 +457,13 @@ def _run_shot(
                     if exr_out.is_file():
                         _log.warning("Re-export empty matte EXR: %s", exr_out.name)
                     matte = proc.process_frame_matting(cache_path(cache_dir, fi))
-                    write_matte_exr(exr_out, matte)
+                    write_matte_alpha_exr(exr_out, matte)
+                    if bool(shared.get("export_matte_premult_exr", True)):
+                        write_matte_premult_exr(
+                            matte_local / f"matte_premult_{fi:06d}.exr", matte
+                        )
                     if not verified_matte:
-                        verify_exr_nonzero(exr_out, label="matte")
+                        verify_exr_nonzero(exr_out, label="matte_alpha")
                         verified_matte = True
                 elif matte_layout == "channels":
                     exr_out = matte_local / f"matte_{fi:06d}.exr"
@@ -506,7 +529,7 @@ def _run_shot(
     if export_matte and run_matting and not _matte_complete(matte_local, n_frames, matte_layout):
         raise RuntimeError(
             f"Incomplete matte on local (layout={matte_layout}): "
-            f"{_exr_count(matte_local, recursive=True)}/{n_frames}"
+            f"{_exr_count(matte_local, recursive=True, matte_primary_only=True)}/{n_frames}"
         )
     if export_normal and run_normal and _exr_count(normal_local) < n_frames:
         raise RuntimeError(f"Incomplete normal on local: {_exr_count(normal_local)}/{n_frames}")
@@ -545,7 +568,7 @@ def _run_shot(
         if export_matte and not _matte_complete(matte_drive, n_frames, matte_layout):
             raise RuntimeError(
                 f"Incomplete matte on Drive (layout={matte_layout}): "
-                f"{_exr_count(matte_drive, recursive=True)}/{n_frames}"
+                f"{_exr_count(matte_drive, recursive=True, matte_primary_only=True)}/{n_frames}"
             )
         if export_normal and _exr_count(normal_drive) < n_frames:
             raise RuntimeError(f"Incomplete normal on Drive: {_exr_count(normal_drive)}/{n_frames}")

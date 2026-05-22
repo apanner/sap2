@@ -20,7 +20,9 @@ for p in (_SCRIPTS, str(_DENSE)):
 os.environ.setdefault("SAPIENS_CHECKPOINT_ROOT", str(_SAP2_ROOT / "checkpoints"))
 
 from exr_io import (  # noqa: E402
+    write_matte_alpha_exr,
     write_matte_exr,
+    write_matte_premult_exr,
     write_matte_subject_channels_exr,
     write_normal_exr,
 )
@@ -91,6 +93,7 @@ def process_shot(job: dict) -> bool:
         model_key=model_key,
         device=device,
         image_feed_mode=feed_mode,
+        matte_image_feed_mode=str(shared.get("matte_image_feed_mode") or "full_res"),
         use_person_crop=bool(shared.get("use_person_crop", True)),
         person_crop_pad=float(shared.get("person_crop_pad", 0.22)),
         person_crop_confidence=float(shared.get("person_crop_confidence", 0.28)),
@@ -111,7 +114,11 @@ def process_shot(job: dict) -> bool:
                     if exr_out.is_file():
                         continue
                     matte = proc.process_frame_matting(cache_path(cache_dir, fi))
-                    write_matte_exr(exr_out, matte)
+                    write_matte_alpha_exr(exr_out, matte)
+                    if bool(shared.get("export_matte_premult_exr", True)):
+                        write_matte_premult_exr(
+                            matte_dir / f"matte_premult_{fi:06d}.exr", matte
+                        )
                 elif matte_layout == "channels":
                     exr_out = matte_dir / f"matte_{fi:06d}.exr"
                     if exr_out.is_file():

@@ -35,6 +35,22 @@ _AUTO_CROP_MIN_MP = 1.05
 _AUTO_CROP_MIN_LONG_EDGE = 1920
 
 
+def resolve_matting_use_person_crop(
+    plate_h: int,
+    plate_w: int,
+    *,
+    matte_image_feed_mode: ImageFeedMode = "full_res",
+    use_person_crop_flag: bool = True,
+) -> bool:
+    """Matting follows official vis_matting: full frame by default (no person-crop paste)."""
+    return resolve_use_person_crop(
+        plate_h,
+        plate_w,
+        image_feed_mode=matte_image_feed_mode,
+        use_person_crop_flag=use_person_crop_flag,
+    )
+
+
 def resolve_use_person_crop(
     plate_h: int,
     plate_w: int,
@@ -185,6 +201,7 @@ class Sap2ShotProcessor:
         person_crop_mode: str = "union",
         matte_subject_layout: MatteSubjectLayout = "combined",
         matte_max_subjects: int = 4,
+        matte_image_feed_mode: ImageFeedMode = "full_res",
     ):
         self.dense_root = Path(dense_root)
         self.ckpt_root = Path(ckpt_root)
@@ -207,6 +224,10 @@ class Sap2ShotProcessor:
             layout = "combined"
         self.matte_subject_layout: MatteSubjectLayout = layout  # type: ignore[assignment]
         self.matte_max_subjects = max(1, min(4, int(matte_max_subjects)))
+        mfeed = str(matte_image_feed_mode or "full_res").strip().lower()
+        if mfeed not in ("auto", "full_res", "person_crop"):
+            mfeed = "full_res"
+        self.matte_image_feed_mode: ImageFeedMode = mfeed  # type: ignore[assignment]
         self._matting_model = None
         self._normal_model = None
         self._crop_tracker = None
@@ -289,12 +310,18 @@ class Sap2ShotProcessor:
 
     def _process_matting_combined_bgr(self, img: np.ndarray) -> np.ndarray:
         h, w = img.shape[:2]
-        use_crop = resolve_use_person_crop(
+        use_crop = resolve_matting_use_person_crop(
             h,
             w,
-            image_feed_mode=self.image_feed_mode,
+            matte_image_feed_mode=self.matte_image_feed_mode,
             use_person_crop_flag=self.use_person_crop_flag,
         )
+        if not getattr(self, "_matte_feed_logged", False):
+            self._matte_feed_logged = True
+            _log.info(
+                "Matting feed: %s (official Sapiens2 = full frame, no crop paste)",
+                "person crop" if use_crop else "full frame",
+            )
         self._log_plate_once(h, w, use_crop)
         self._ensure_matting()
         assert self._matting_model is not None
@@ -312,10 +339,10 @@ class Sap2ShotProcessor:
     def _process_matting_per_subject_bgr(self, img: np.ndarray) -> List[np.ndarray]:
         """Full-plate RGBA matte per person (left→right index)."""
         h, w = img.shape[:2]
-        use_crop = resolve_use_person_crop(
+        use_crop = resolve_matting_use_person_crop(
             h,
             w,
-            image_feed_mode=self.image_feed_mode,
+            matte_image_feed_mode=self.matte_image_feed_mode,
             use_person_crop_flag=self.use_person_crop_flag,
         )
         self._log_plate_once(h, w, use_crop)

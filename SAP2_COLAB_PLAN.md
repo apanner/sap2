@@ -67,7 +67,7 @@ Same idea as LAOV: after EXR infer, build H.264 previews under `qc/` with **plat
 
 | File | Content |
 |------|---------|
-| `{shot}_matte_qc.mp4` | Combined matte (premult RGB or alpha) on plate |
+| `{shot}_matte_qc.mp4` | Official-style composite: premult fg over green (uses `matte_premult_*.exr` when present) |
 | `{shot}_matte_channels_qc.mp4` | R/G/B/A person masks as red/green/blue/white |
 | `{shot}_matte_p00_qc.mp4` | Per-person folder (`layout=separate`) |
 | `{shot}_normal_qc.mp4` | Surface normals (0.5·n+0.5) on plate |
@@ -79,7 +79,8 @@ Set `"qc_mp4": false` in JSON to skip. `"qc_fps": 24` optional. **`qc_max_long_e
 
 Writes use **`ImageOutput.write_image`** + zip compression (same as LAOV `oiio_io.write_exr`), not `ImageBuf.set_pixels` (that path produced **black/empty EXRs**).
 
-- **Matte:** straight RGB + **A** (readable in Nuke; premult from model is unpremulted on write)
+- **Matte (official):** **`matte_%06d.exr`** = single **A** channel alpha in [0,1] (same data as Sapiens2 `_alpha.npy`; repo does not ship EXR)
+- **Matte (optional):** **`matte_premult_%06d.exr`** = premult **R,G,B,A** from model head (vis_matting composite)
 - **Normal:** unit **R,G,B** in [-1, 1] (like LAOV `n.x` / `n.y` / `n.z`)
 
 After `git pull`, re-run Cell 3 — empty old EXRs are **auto re-exported** (detected via read-back).
@@ -107,6 +108,8 @@ Desk / manual JSON (same shape as LAOV batch):
     "run_matting": true,
     "run_normal": true,
     "image_feed_mode": "auto",
+    "matte_image_feed_mode": "full_res",
+    "export_matte_premult_exr": true,
     "use_person_crop": true,
     "person_crop_pad": 0.22,
     "person_crop_mode": "union",

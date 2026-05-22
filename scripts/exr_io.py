@@ -126,22 +126,32 @@ def write_alpha_exr(path: Path, alpha: np.ndarray) -> None:
     write_exr_float(path, a, channels=1, channel_names=("A",))
 
 
-def write_matte_exr(path: Path, matte_rgba: np.ndarray) -> None:
+def write_matte_alpha_exr(path: Path, alpha: np.ndarray) -> None:
     """
-    Sapiens2 matte: premult RGB + alpha.
-    Also writes straight RGB where alpha>0 so Nuke RGB view is not empty black.
+    Official Sapiens2 primary output (see vis_matting --save_pred): alpha in [0, 1].
+    https://github.com/facebookresearch/sapiens2 — single-channel matte for Nuke.
     """
+    a = np.clip(_to_float32_c(alpha), 0.0, 1.0)
+    if a.ndim == 3:
+        a = a[..., 0]
+    write_exr_float(path, a, channels=1, channel_names=("A",))
+
+
+def write_matte_premult_exr(path: Path, matte_rgba: np.ndarray) -> None:
+    """Premultiplied foreground RGB + alpha exactly as model outputs (4 ch)."""
     m = _to_float32_c(matte_rgba)
     if m.ndim != 3 or m.shape[-1] != 4:
-        raise ValueError(f"matte must be HxWx4, got {m.shape}")
-    rgb = np.clip(m[..., :3], 0.0, 1.0)
-    a = np.clip(m[..., 3], 0.0, 1.0)
-    # Unpremult for display/comp: straight RGB + alpha (LAOV-style readable mattes)
-    straight = np.zeros_like(rgb)
-    mask = a > 1e-5
-    straight[mask] = rgb[mask] / a[mask, np.newaxis]
-    out = np.concatenate([straight, a[..., np.newaxis]], axis=-1)
-    write_exr_float(path, out, channels=4, channel_names=("R", "G", "B", "A"))
+        raise ValueError(f"matte must be HxWx4 premult RGB+A, got {m.shape}")
+    m = np.clip(m, 0.0, 1.0)
+    write_exr_float(path, m, channels=4, channel_names=("R", "G", "B", "A"))
+
+
+def write_matte_exr(path: Path, matte_rgba: np.ndarray) -> None:
+    """Default matte deliverable: alpha-only EXR (official). Premult optional via write_matte_premult_exr."""
+    if matte_rgba.ndim == 3 and matte_rgba.shape[-1] == 4:
+        write_matte_alpha_exr(path, matte_rgba[:, :, 3])
+    else:
+        write_matte_alpha_exr(path, matte_rgba)
 
 
 def write_matte_subject_channels_exr(

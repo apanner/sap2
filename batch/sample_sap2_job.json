@@ -6,6 +6,8 @@
     "run_matting": true,
     "run_normal": true,
     "export_matte_exr": true,
+    "export_matte_premult_exr": true,
+    "matte_image_feed_mode": "full_res",
     "export_normal_exr": true,
     "use_plate_jpeg_cache": true,
     "plate_jpeg_quality": 92,

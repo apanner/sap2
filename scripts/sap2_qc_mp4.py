@@ -14,6 +14,7 @@ from exr_io import read_exr_pixels
 _log = logging.getLogger("sap2_qc_mp4")
 
 _FRAME_RE = re.compile(r"_(\d{4,8})\.exr$", re.IGNORECASE)
+_MATTE_PRIMARY_RE = re.compile(r"^matte_\d+\.exr$", re.IGNORECASE)
 _SUBJECT_DIR_RE = re.compile(r"^p(\d{2})$")
 
 # Default: 1920px long edge → 1080×1920 for portrait 4K plates, 1920×1080 for landscape
@@ -32,6 +33,10 @@ def _sorted_exrs(folder: Path) -> list[tuple[int, Path]]:
         return []
     by_frame: dict[int, Path] = {}
     for path in sorted(folder.glob("*.exr")):
+        if "premult" in path.stem.lower():
+            continue
+        if path.name.lower().startswith("matte_") and not _MATTE_PRIMARY_RE.match(path.name):
+            continue
         m = _FRAME_RE.search(path.name)
         if m:
             by_frame[int(m.group(1))] = path
@@ -130,26 +135,47 @@ def _read_plate_bgr(
     return None
 
 
-def _matte_combined_rgb(pixels: np.ndarray, names: tuple[str, ...]) -> np.ndarray | None:
-    """EXR: straight RGB + A (LAOV-style readable matte)."""
-    r = _channel_plane(pixels, names, "R")
-    g = _channel_plane(pixels, names, "G")
-    b = _channel_plane(pixels, names, "B")
+def _read_alpha_plane(pixels: np.ndarray, names: tuple[str, ...]) -> np.ndarray | None:
+    if len(names) == 1:
+        return np.clip(pixels[..., 0], 0.0, 1.0)
     a = _channel_plane(pixels, names, "A")
-    h, w = pixels.shape[0], pixels.shape[1]
-    if a is None and r is None:
-        return None
-    rgb = np.zeros((h, w, 3), dtype=np.float32)
-    if r is not None:
-        rgb[..., 0] = r
-    if g is not None:
-        rgb[..., 1] = g
-    if b is not None:
-        rgb[..., 2] = b
     if a is not None:
-        # Tint by alpha so QC shows silhouette even when RGB is black outside fg
-        return rgb * a[..., np.newaxis]
-    return rgb
+        return a
+    return None
+
+
+def _official_matte_composite_rgb(
+    plate_rgb: np.ndarray, fgr_premult_rgb: np.ndarray, alpha: np.ndarray
+) -> np.ndarray:
+    """Match vis_matting.py: premult fgr over chroma green."""
+    fgr_bgr = np.clip(fgr_premult_rgb[..., :3], 0.0, 1.0)[:, :, ::-1]
+    bg = np.array([64, 177, 0], dtype=np.float32) / 255.0
+    a = np.clip(alpha, 0.0, 1.0)[..., np.newaxis]
+    comp_bgr = fgr_bgr + (1.0 - a) * bg
+    return np.clip(comp_bgr[:, :, ::-1], 0.0, 1.0)
+
+
+def _matte_official_vis(
+    exr_path: Path,
+    plate_cache_dir: Path | None,
+    frame_idx: int,
+) -> np.ndarray | None:
+    pixels, names = read_exr_pixels(exr_path)
+    alpha = _read_alpha_plane(pixels, names)
+    if alpha is None:
+        return None
+    h, w = alpha.shape
+    premult_path = exr_path.parent / exr_path.name.replace("matte_", "matte_premult_", 1)
+    if premult_path.is_file():
+        px, nm = read_exr_pixels(premult_path)
+        fgr = np.clip(px[..., :3], 0.0, 1.0)
+    else:
+        fgr = np.stack([alpha, alpha, alpha], axis=-1)
+    plate = _read_plate_bgr(plate_cache_dir, frame_idx)
+    if plate is not None and plate.shape[:2] == (h, w):
+        return _official_matte_composite_rgb(plate, fgr, alpha)
+    alpha_vis = np.stack([alpha, alpha, alpha], axis=-1)
+    return alpha_vis
 
 
 def _matte_channels_rgb(pixels: np.ndarray, names: tuple[str, ...]) -> np.ndarray | None:
@@ -215,13 +241,13 @@ def _export_stage_mp4(
     for frame_idx, exr_path in entries:
         pixels, names = read_exr_pixels(exr_path)
         if vis_kind == "matte_combined":
-            rgb = _matte_combined_rgb(pixels, names)
+            rgb = _matte_official_vis(exr_path, plate_cache_dir, frame_idx)
         elif vis_kind == "matte_channels":
             rgb = _matte_channels_rgb(pixels, names)
         elif vis_kind == "normal":
             rgb = _normal_display_rgb(pixels, names)
         else:
-            rgb = _matte_combined_rgb(pixels, names)
+            rgb = _matte_official_vis(exr_path, plate_cache_dir, frame_idx)
         if rgb is None:
             continue
         frames_rgb.append(
@@ -276,18 +302,21 @@ def _export_review_mp4(
                 if sub.is_dir() and _SUBJECT_DIR_RE.match(sub.name):
                     exr_map = dict(_sorted_exrs(sub))
                     if frame_idx in exr_map:
-                        px, names = read_exr_pixels(exr_map[frame_idx])
-                        matte_rgb = _matte_combined_rgb(px, names)
+                        matte_rgb = _matte_official_vis(
+                            exr_map[frame_idx], plate_cache_dir, frame_idx
+                        )
                         break
         else:
             exr_map = dict(_sorted_exrs(matte_dir))
             if frame_idx in exr_map:
-                px, names = read_exr_pixels(exr_map[frame_idx])
-                matte_rgb = (
-                    _matte_channels_rgb(px, names)
-                    if matte_layout == "channels"
-                    else _matte_combined_rgb(px, names)
-                )
+                exr_path = exr_map[frame_idx]
+                if matte_layout == "channels":
+                    px, names = read_exr_pixels(exr_path)
+                    matte_rgb = _matte_channels_rgb(px, names)
+                else:
+                    matte_rgb = _matte_official_vis(
+                        exr_path, plate_cache_dir, frame_idx
+                    )
 
         ref = plate if plate is not None else norm_rgb
         ref_u8 = _fit_long_edge_uint8(
