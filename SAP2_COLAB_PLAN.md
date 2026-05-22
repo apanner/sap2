@@ -90,9 +90,9 @@ After `git pull`, re-run Cell 3 — empty old EXRs are **auto re-exported** (det
 
 | Layout | Output | Nuke |
 |--------|--------|------|
-| **`combined`** (default) | One RGBA EXR — premult RGB + A, all people (union crop) | Single Read; one comp matte |
-| **`channels`** | One EXR — **R,G,B,A = alpha** for person 0,1,2,3 (left→right) | One Read; ShuffleCopy / Dot Product per channel |
-| **`separate`** | `matte/p00/`, `matte/p01/`, … full-plate RGBA per person | One Read per person; most flexible |
+| **`combined`** (default) | **`matte_%06d.exr`** = full-plate **RGB seg colors** (all people + parts) | Read as RGB — matches Sapiens2 SEG demo |
+| **`channels`** | Color seg in `matte_*.exr` + **`matte_people_*.exr`** (R,G,B,A = per-person silhouette) | Seg colors + separate people masks |
+| **`separate`** | Color seg in `matte_*.exr` + `p00/`, `p01/` per-person alpha | One Read per person mask |
 
 Subject index is **left → right** by bbox center (stable across frames). Max **4** people (`matte_max_subjects`).
 
@@ -144,7 +144,8 @@ Desk / manual JSON (same shape as LAOV batch):
 
 Cell 3 downloads to `/content/sapiens2_checkpoints`:
 
-- `matting/sapiens2_1b_matting.safetensors`
+- `seg/sapiens2_1b_seg.safetensors` (default matte / segmentation)
+- `matting/sapiens2_1b_matting.safetensors` (only if `matte_output_mode` is `alpha` or `both`)
 - `normal/sapiens2_1b_normal.safetensors`
 
 Person detect: try MobileNet-SSD (`/content/sap2_models/person_det/`); **if that fails → OpenCV HOG** (no download). Force HOG only: `SAP2_PERSON_DET_BACKEND=hog`.
