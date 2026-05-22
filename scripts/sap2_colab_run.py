@@ -219,7 +219,11 @@ def _matte_exr_outdated(path: Path) -> bool:
     try:
         arr, names = read_exr_pixels(path)
         if path.name.startswith("matte_id_"):
-            return "class_id" not in names and "Z" in names
+            nl = {n.lower() for n in names}
+            has_layers = "class_id.red" in nl or any(
+                n.startswith("class_id.") for n in nl
+            )
+            return not has_layers
         if path.name.startswith("matte_") and "premult" not in path.name.lower():
             return "A" not in names and arr.shape[-1] < 4
         return False
@@ -242,7 +246,12 @@ def _write_seg_matte_bundle(
     if bool(shared.get("export_matte_alpha_exr", True)):
         write_matte_alpha_exr(matte_local / f"matte_alpha_{fi:06d}.exr", human_alpha)
     if bool(shared.get("export_matte_seg_id_exr", True)):
-        write_seg_id_exr(matte_local / f"matte_id_{fi:06d}.exr", labels)
+        write_seg_id_exr(
+            matte_local / f"matte_id_{fi:06d}.exr",
+            labels,
+            person_masks=person_masks,
+            max_people=int(shared.get("matte_max_subjects", 4)),
+        )
     if person_masks:
         packed, ch_names = pack_subject_alpha_channels(person_masks)
         write_exr_float(

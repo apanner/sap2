@@ -178,16 +178,46 @@ def write_seg_color_exr(path: Path, color_rgb: np.ndarray) -> None:
     write_exr_float(path, rgb, channels=3, channel_names=("R", "G", "B"))
 
 
-def write_seg_id_exr(path: Path, label_map: np.ndarray) -> None:
+def write_seg_id_exr(
+    path: Path,
+    label_map: np.ndarray,
+    *,
+    person_masks: list[np.ndarray] | None = None,
+    max_people: int = 4,
+) -> None:
     """
-    Per-pixel class index 0–28 + human alpha.
-    Channels: class_id, A — NOT depth.Z (Nuke maps Z → depth layer).
+    Nuke EXR layers (layer.channel names):
+
+    - class_id.red   — body-part class index 0–28 (float)
+    - mask.alpha     — combined human silhouette (both people)
+    - people.red/green/blue/alpha — per-person mattes when 2+ detected
     """
     labels = np.asarray(label_map, dtype=np.int32)
+    h, w = labels.shape
     ids = labels.astype(np.float32)
     alpha = (labels > 0).astype(np.float32)
-    packed = np.dstack([ids, alpha])
-    write_exr_float(path, packed, channels=2, channel_names=("class_id", "A"))
+
+    planes: list[np.ndarray] = [ids, alpha]
+    names: list[str] = ["class_id.red", "mask.alpha"]
+
+    if person_masks:
+        people = np.zeros((h, w, max_people), dtype=np.float32)
+        for i, m in enumerate(person_masks[:max_people]):
+            m = np.asarray(m, dtype=np.float32)
+            if m.ndim == 3 and m.shape[-1] == 4:
+                m = m[:, :, 3]
+            if m.shape[:2] != (h, w):
+                import cv2
+
+                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
+            people[:, :, i] = np.clip(m, 0.0, 1.0)
+        slot_names = ("red", "green", "blue", "alpha")
+        for i in range(max_people):
+            planes.append(people[:, :, i])
+            names.append(f"people.{slot_names[i]}")
+
+    packed = np.stack(planes, axis=-1)
+    write_exr_float(path, packed, channels=len(names), channel_names=tuple(names))
 
 
 def write_matte_subject_channels_exr(

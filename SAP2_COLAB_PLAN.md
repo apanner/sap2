@@ -82,7 +82,7 @@ Writes use **`ImageOutput.write_image`** + zip compression (same as LAOV `oiio_i
 - **Matte default (`matte_output_mode: segmentation`):**
   - **`matte_%06d.exr`** — **RGBA**: RGB = body-part colors, **A = combined human alpha** (bw comp mask, both people)
   - **`matte_alpha_%06d.exr`** — **A only** (same bw mask, for simple Read → Merge)
-  - **`matte_id_%06d.exr`** — **class_id** (0–28 part index) + **A** (fg mask). **Not** depth.Z
+  - **`matte_id_%06d.exr`** — Nuke **layers**: `class_id.red` (0–28), `mask.alpha` (human bw), `people.red/green/blue/alpha` (per person)
   - **`matte_people_%06d.exr`** — R,G,B,A = per-person silhouette (when 2+ people)
 - **Normal:** unit **R,G,B** in [-1, 1]
 
@@ -94,8 +94,9 @@ This is **semantic body-part segmentation**, not Cryptomatte. Typical comp:
 |------|------|---------|
 | **Merge people over bg** | Read `matte_*.exr` or `matte_alpha_*.exr` | **alpha** |
 | **View part colors** | Read `matte_*.exr` | **rgb** |
-| **Mask one body part** | Read `matte_id_*.exr` → Grade/Expression | **class_id** == N (see [SEG class list](https://github.com/facebookresearch/sapiens2/blob/main/docs/SEG.md)) |
-| **Per person** | Read `matte_people_*.exr` | **R**=person0, **G**=person1, … |
+| **Mask one body part** | Read `matte_id_*.exr` → layer **class_id**, channel **red** | Expression: `class_id.red == 4` (Hair) |
+| **Combined human mask** | Read `matte_id_*.exr` → layer **mask**, channel **alpha** | Same as matte_alpha |
+| **Per person** | Read `matte_id_*.exr` → layer **people** | **red**=person0, **green**=person1, … (or `matte_people_*.exr`) |
 
 Example: hair mask → `class_id == 4` (Hair). Torso → `class_id == 22`.
 

@@ -120,7 +120,7 @@ def process_shot(job: dict) -> bool:
                 if exr_out.is_file():
                     continue
                 if run_seg:
-                    labels, color, _ = proc.process_frame_segmentation_subjects(
+                    labels, color, person_masks = proc.process_frame_segmentation_subjects(
                         cache_path(cache_dir, fi)
                     )
                     human_alpha = labels_to_human_alpha(labels)
@@ -130,7 +130,12 @@ def process_shot(job: dict) -> bool:
                             matte_dir / f"matte_alpha_{fi:06d}.exr", human_alpha
                         )
                     if bool(shared.get("export_matte_seg_id_exr", True)):
-                        write_seg_id_exr(matte_dir / f"matte_id_{fi:06d}.exr", labels)
+                        write_seg_id_exr(
+                            matte_dir / f"matte_id_{fi:06d}.exr",
+                            labels,
+                            person_masks=person_masks,
+                            max_people=int(shared.get("matte_max_subjects", 4)),
+                        )
                 if run_alpha:
                     matte = proc.process_frame_matting(cache_path(cache_dir, fi))
                     alpha_path = exr_out if not run_seg else matte_dir / f"matte_alpha_{fi:06d}.exr"
