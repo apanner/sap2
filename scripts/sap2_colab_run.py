@@ -14,6 +14,8 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 _SCRIPTS = Path(__file__).resolve().parent
 _SAP2_ROOT = _SCRIPTS.parent
 _DENSE = _SAP2_ROOT / "sapiens" / "dense"
@@ -21,6 +23,8 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from exr_io import (  # noqa: E402
+    read_exr_pixels,
+    verify_exr_nonzero,
     write_matte_exr,
     write_matte_subject_channels_exr,
     write_normal_exr,
@@ -181,6 +185,17 @@ def _merge_shared(job: dict[str, Any]) -> dict[str, Any]:
 
 def _frame_count(frame_start: int, frame_end: int) -> int:
     return max(0, frame_end - frame_start + 1)
+
+
+def _exr_is_empty(path: Path) -> bool:
+    """True if EXR reads as all ~zero (broken ImageBuf-era writes)."""
+    if not path.is_file():
+        return True
+    try:
+        arr, _ = read_exr_pixels(path)
+        return float(np.max(np.abs(arr))) < 1e-5
+    except Exception:
+        return True
 
 
 def _exr_count(folder: Path, *, recursive: bool = False) -> int:
@@ -413,23 +428,32 @@ def _run_shot(
                 matte_layout = "combined"
             _log.info("Matte subject layout: %s", matte_layout)
             done = 0
+            verified_matte = False
             for fi in range(frame_start, frame_end + 1):
                 if matte_layout == "combined":
                     exr_out = matte_local / f"matte_{fi:06d}.exr"
-                    if exr_out.is_file():
+                    if exr_out.is_file() and not _exr_is_empty(exr_out):
                         done += 1
                         continue
+                    if exr_out.is_file():
+                        _log.warning("Re-export empty matte EXR: %s", exr_out.name)
                     matte = proc.process_frame_matting(cache_path(cache_dir, fi))
                     write_matte_exr(exr_out, matte)
+                    if not verified_matte:
+                        verify_exr_nonzero(exr_out, label="matte")
+                        verified_matte = True
                 elif matte_layout == "channels":
                     exr_out = matte_local / f"matte_{fi:06d}.exr"
-                    if exr_out.is_file():
+                    if exr_out.is_file() and not _exr_is_empty(exr_out):
                         done += 1
                         continue
                     subjects = proc.process_frame_matting_subjects(
                         cache_path(cache_dir, fi)
                     )
                     write_matte_subject_channels_exr(exr_out, subjects)
+                    if not verified_matte:
+                        verify_exr_nonzero(exr_out, label="matte_ch")
+                        verified_matte = True
                 else:
                     subjects = proc.process_frame_matting_subjects(
                         cache_path(cache_dir, fi)
@@ -438,9 +462,12 @@ def _run_shot(
                         sub_dir = matte_local / f"p{si:02d}"
                         sub_dir.mkdir(parents=True, exist_ok=True)
                         exr_out = sub_dir / f"matte_{fi:06d}.exr"
-                        if exr_out.is_file():
+                        if exr_out.is_file() and not _exr_is_empty(exr_out):
                             continue
                         write_matte_exr(exr_out, subj)
+                        if not verified_matte:
+                            verify_exr_nonzero(exr_out, label=f"matte_{si:02d}")
+                            verified_matte = True
                 done += 1
                 if done == 1 or done % 10 == 0 or done == n_frames:
                     _log.info("Matte → local %d/%d", done, n_frames)
@@ -454,13 +481,19 @@ def _run_shot(
             normal_local.mkdir(parents=True, exist_ok=True)
             assert proc is not None
             done = 0
+            verified_normal = False
             for fi in range(frame_start, frame_end + 1):
                 exr_out = normal_local / f"normal_{fi:06d}.exr"
-                if exr_out.is_file():
+                if exr_out.is_file() and not _exr_is_empty(exr_out):
                     done += 1
                     continue
+                if exr_out.is_file():
+                    _log.warning("Re-export empty normal EXR: %s", exr_out.name)
                 normal = proc.process_frame_normal(cache_path(cache_dir, fi))
                 write_normal_exr(exr_out, normal)
+                if not verified_normal:
+                    verify_exr_nonzero(exr_out, label="normal")
+                    verified_normal = True
                 done += 1
                 if done == 1 or done % 10 == 0 or done == n_frames:
                     _log.info("Normal → local %d/%d", done, n_frames)

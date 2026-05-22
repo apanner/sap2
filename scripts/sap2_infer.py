@@ -111,8 +111,17 @@ def _run_matting_on_bgr(model: Any, image_bgr: np.ndarray) -> np.ndarray:
         mode="bilinear",
         align_corners=False,
     )
-    chw = out.squeeze(0).float().cpu().numpy().clip(0.0, 1.0)  # 4 x H x W
+    chw = out.squeeze(0).float().cpu().numpy()  # 4 x H x W
     rgba = np.ascontiguousarray(chw.transpose(1, 2, 0), dtype=np.float32)
+    rgba = np.clip(rgba, 0.0, 1.0)
+    if not getattr(_run_matting_on_bgr, "_logged_once", False):
+        _run_matting_on_bgr._logged_once = True  # type: ignore[attr-defined]
+        _log.info(
+            "Matting infer stats: alpha max=%.3f mean=%.3f rgb max=%.3f",
+            float(rgba[:, :, 3].max()),
+            float(rgba[:, :, 3].mean()),
+            float(rgba[:, :, :3].max()),
+        )
     del data, inputs, out
     return rgba
 
@@ -140,9 +149,17 @@ def _run_normal_on_bgr(model: Any, image_bgr: np.ndarray) -> np.ndarray:
         mode="bilinear",
         align_corners=False,
     )
-    out = normal.squeeze(0).cpu().numpy().transpose(1, 2, 0)
+    out = normal.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)
+    if not getattr(_run_normal_on_bgr, "_logged_once", False):
+        _run_normal_on_bgr._logged_once = True  # type: ignore[attr-defined]
+        _log.info(
+            "Normal infer stats: min=%.3f max=%.3f mean=%.3f",
+            float(out.min()),
+            float(out.max()),
+            float(out.mean()),
+        )
     del data, inputs, normal
-    return np.ascontiguousarray(out.astype(np.float32))
+    return np.ascontiguousarray(out)
 
 
 class Sap2ShotProcessor:

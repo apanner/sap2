@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
-"""Minimal EXR read/write for SAP2 Colab (OpenImageIO)."""
+"""EXR read/write for SAP2 — LAOV-style OpenImageIO (ImageInput/ImageOutput)."""
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+_log = logging.getLogger("sap2_exr_io")
 
 
 def require_oiio() -> Any:
@@ -27,52 +30,57 @@ def pattern_to_path(plate_dir: Path, pattern: str, frame: int) -> Path:
     return plate_dir / stem
 
 
-def read_exr_pixels(path: Path) -> tuple[np.ndarray, tuple[str, ...]]:
-    """Read all channels as H×W×C float32 and channel names."""
-    oiio = require_oiio()
-    buf = oiio.ImageBuf(str(path))
-    if buf.has_error:
-        raise RuntimeError(f"OIIO read failed: {path} — {buf.geterror()}")
-    spec = buf.spec()
-    arr = buf.get_pixels(oiio.FLOAT)
-    if arr is None:
-        raise RuntimeError(f"OIIO get_pixels failed: {path}")
-    arr = np.asarray(arr, dtype=np.float32)
+def _ensure_hwc(pixels: Any, height: int, width: int, nchannels: int) -> np.ndarray:
+    arr = np.asarray(pixels, dtype=np.float32)
     if arr.ndim == 2:
-        arr = arr[..., np.newaxis]
-    names = tuple(spec.channelnames) if spec.channelnames else tuple(
-        f"ch{i}" for i in range(arr.shape[-1])
-    )
-    return np.ascontiguousarray(arr, dtype=np.float32), names
-
-
-def read_plate_rgb(path: Path) -> np.ndarray:
-    oiio = require_oiio()
-    buf = oiio.ImageBuf(str(path))
-    if buf.has_error:
-        raise RuntimeError(f"OIIO read failed: {path} — {buf.geterror()}")
-    spec = buf.spec()
-    arr = buf.get_pixels(oiio.FLOAT)
-    if arr is None:
-        raise RuntimeError(f"OIIO get_pixels failed: {path}")
-    arr = np.asarray(arr, dtype=np.float32)
-    if arr.ndim == 2:
-        arr = np.stack([arr, arr, arr], axis=-1)
-    nch = spec.nchannels
-    if nch >= 3:
-        rgb = arr[..., :3]
-    else:
-        rgb = np.stack([arr[..., 0]] * 3, axis=-1)
-    return np.array(rgb, dtype=np.float32, copy=True, order="C")
-
-
-def _to_float32_c(arr: np.ndarray) -> np.ndarray:
-    """Force C-contiguous float32 (required by OIIO set_pixels Buffer API)."""
+        arr = arr.reshape(height, width, 1)
+    elif arr.ndim == 3 and arr.shape != (height, width, nchannels):
+        arr = arr.reshape(height, width, nchannels)
     return np.ascontiguousarray(arr, dtype=np.float32)
 
 
-def write_exr_float(path: Path, data: np.ndarray, *, channels: int | None = None) -> None:
+def read_exr_pixels(path: Path) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Read all channels as H×W×C float32 (LAOV read_plate pattern)."""
     oiio = require_oiio()
+    inp = oiio.ImageInput.open(str(path))
+    if inp is None:
+        raise RuntimeError(f"OIIO open failed: {path}")
+    try:
+        spec = inp.spec()
+        pixels = inp.read_image(format=oiio.FLOAT)
+        if pixels is None:
+            raise RuntimeError(f"OIIO read_image failed: {path}")
+        arr = _ensure_hwc(pixels, spec.height, spec.width, spec.nchannels)
+        names = tuple(spec.channelnames) if spec.channelnames else tuple(
+            f"ch{i}" for i in range(arr.shape[-1])
+        )
+        return arr, names
+    finally:
+        inp.close()
+
+
+def read_plate_rgb(path: Path) -> np.ndarray:
+    arr, _names = read_exr_pixels(path)
+    if arr.shape[-1] >= 3:
+        return arr[..., :3].copy()
+    return np.stack([arr[..., 0]] * 3, axis=-1)
+
+
+def _to_float32_c(arr: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+def write_exr_float(
+    path: Path,
+    data: np.ndarray,
+    *,
+    channels: int | None = None,
+    channel_names: tuple[str, ...] | None = None,
+    compression: str = "zip",
+) -> None:
+    """Write H×W×C float32 EXR via ImageOutput.write_image (same as LAOV oiio_io)."""
+    oiio = require_oiio()
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     arr = _to_float32_c(data)
     if arr.ndim == 2:
@@ -84,41 +92,56 @@ def write_exr_float(path: Path, data: np.ndarray, *, channels: int | None = None
     if nc > c:
         arr = _to_float32_c(arr[:, :, :c])
 
-    spec = oiio.ImageSpec(w, h, c, oiio.FLOAT)
-    if c == 1:
-        spec.channelnames = ("A",)
+    if channel_names is not None:
+        if len(channel_names) != c:
+            raise ValueError(f"channel_names len {len(channel_names)} != {c}")
+        names = tuple(channel_names)
+    elif c == 1:
+        names = ("A",)
     elif c == 3:
-        spec.channelnames = ("R", "G", "B")
+        names = ("R", "G", "B")
     elif c == 4:
-        spec.channelnames = ("R", "G", "B", "A")
-
-    buf = oiio.ImageBuf(spec)
-    roi = oiio.ROI(0, w, 0, h, 0, 1, 0, c)
-
-    # oiio-python: single contiguous buffer only (not a list of planar channels)
-    if c == 1:
-        pixels = _to_float32_c(arr[:, :, 0])
+        names = ("R", "G", "B", "A")
     else:
-        pixels = _to_float32_c(arr)
+        names = tuple(f"ch{i}" for i in range(c))
 
-    if not buf.set_pixels(roi, pixels):
-        raise RuntimeError(f"OIIO set_pixels failed: {path} — {buf.geterror()}")
-    if not buf.write(str(path)):
-        raise RuntimeError(f"OIIO write failed: {path} — {buf.geterror()}")
+    spec = oiio.ImageSpec(w, h, c, oiio.FLOAT)
+    spec.channelnames = names
+    spec.attribute("compression", compression)
+
+    out = oiio.ImageOutput.create(str(path))
+    if out is None:
+        raise RuntimeError(f"No ImageOutput for {path}")
+    try:
+        if not out.open(str(path), spec):
+            raise RuntimeError(f"OIIO open for write failed: {path}")
+        if not out.write_image(arr):
+            raise RuntimeError(f"OIIO write_image failed: {path}")
+    finally:
+        out.close()
 
 
 def write_alpha_exr(path: Path, alpha: np.ndarray) -> None:
     a = np.clip(_to_float32_c(alpha), 0.0, 1.0)
-    write_exr_float(path, a, channels=1)
+    write_exr_float(path, a, channels=1, channel_names=("A",))
 
 
 def write_matte_exr(path: Path, matte_rgba: np.ndarray) -> None:
-    """Sapiens2 matte: premultiplied RGB + alpha (4 channels, Nuke R,G,B,A)."""
+    """
+    Sapiens2 matte: premult RGB + alpha.
+    Also writes straight RGB where alpha>0 so Nuke RGB view is not empty black.
+    """
     m = _to_float32_c(matte_rgba)
     if m.ndim != 3 or m.shape[-1] != 4:
-        raise ValueError(f"matte must be HxWx4 (premult RGB + A), got {m.shape}")
-    m = np.clip(m, 0.0, 1.0)
-    write_exr_float(path, m, channels=4)
+        raise ValueError(f"matte must be HxWx4, got {m.shape}")
+    rgb = np.clip(m[..., :3], 0.0, 1.0)
+    a = np.clip(m[..., 3], 0.0, 1.0)
+    # Unpremult for display/comp: straight RGB + alpha (LAOV-style readable mattes)
+    straight = np.zeros_like(rgb)
+    mask = a > 1e-5
+    straight[mask] = rgb[mask] / a[mask, np.newaxis]
+    out = np.concatenate([straight, a[..., np.newaxis]], axis=-1)
+    write_exr_float(path, out, channels=4, channel_names=("R", "G", "B", "A"))
 
 
 def write_matte_subject_channels_exr(
@@ -127,10 +150,6 @@ def write_matte_subject_channels_exr(
     *,
     max_subjects: int = 4,
 ) -> None:
-    """
-    Pack per-person alpha into R,G,B,A (subject 0→R … 3→A).
-    Same layout as LAOV AI-matte multi-matte; one Read node in Nuke.
-    """
     if not subject_rgba:
         raise ValueError("subject_rgba is empty")
     h, w = subject_rgba[0].shape[:2]
@@ -142,14 +161,37 @@ def write_matte_subject_channels_exr(
             packed[:, :, i] = np.clip(subj[:, :, 3], 0.0, 1.0)
         else:
             packed[:, :, i] = np.clip(subj, 0.0, 1.0)
-    write_exr_float(path, packed, channels=max_subjects)
+    names = ("R", "G", "B", "A")[:max_subjects]
+    write_exr_float(path, packed, channels=max_subjects, channel_names=names)
 
 
 def write_normal_exr(path: Path, normal: np.ndarray) -> None:
+    """Unit normals in [-1, 1] as R,G,B (LAOV n.x/n.y/n.z equivalent)."""
     n = _to_float32_c(normal)
     if n.shape[-1] != 3:
         raise ValueError(f"normal must be HxWx3, got {n.shape}")
     norm = np.linalg.norm(n, axis=-1, keepdims=True)
     n = n / np.maximum(norm, 1e-8)
     n = np.clip(n, -1.0, 1.0)
-    write_exr_float(path, _to_float32_c(n), channels=3)
+    write_exr_float(path, n, channels=3, channel_names=("R", "G", "B"))
+
+
+def verify_exr_nonzero(path: Path, *, label: str = "") -> dict[str, float]:
+    """Read-back sanity check after write (logs min/max)."""
+    arr, names = read_exr_pixels(path)
+    stats = {
+        "max": float(np.max(arr)),
+        "min": float(np.min(arr)),
+        "mean": float(np.mean(arr)),
+    }
+    _log.info(
+        "EXR verify %s%s: shape=%s ch=%s min=%.4f max=%.4f mean=%.4f",
+        label,
+        path.name,
+        arr.shape,
+        names,
+        stats["min"],
+        stats["max"],
+        stats["mean"],
+    )
+    return stats

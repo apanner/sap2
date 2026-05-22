@@ -131,23 +131,25 @@ def _read_plate_bgr(
 
 
 def _matte_combined_rgb(pixels: np.ndarray, names: tuple[str, ...]) -> np.ndarray | None:
+    """EXR: straight RGB + A (LAOV-style readable matte)."""
     r = _channel_plane(pixels, names, "R")
     g = _channel_plane(pixels, names, "G")
     b = _channel_plane(pixels, names, "B")
     a = _channel_plane(pixels, names, "A")
     h, w = pixels.shape[0], pixels.shape[1]
-    if r is not None or g is not None or b is not None:
-        rgb = np.zeros((h, w, 3), dtype=np.float32)
-        if r is not None:
-            rgb[..., 0] = r
-        if g is not None:
-            rgb[..., 1] = g
-        if b is not None:
-            rgb[..., 2] = b
-        return rgb
+    if a is None and r is None:
+        return None
+    rgb = np.zeros((h, w, 3), dtype=np.float32)
+    if r is not None:
+        rgb[..., 0] = r
+    if g is not None:
+        rgb[..., 1] = g
+    if b is not None:
+        rgb[..., 2] = b
     if a is not None:
-        return np.stack([a, a, a], axis=-1)
-    return None
+        # Tint by alpha so QC shows silhouette even when RGB is black outside fg
+        return rgb * a[..., np.newaxis]
+    return rgb
 
 
 def _matte_channels_rgb(pixels: np.ndarray, names: tuple[str, ...]) -> np.ndarray | None:

@@ -75,6 +75,15 @@ Same idea as LAOV: after EXR infer, build H.264 previews under `qc/` with **plat
 
 Set `"qc_mp4": false` in JSON to skip. `"qc_fps": 24` optional. **`qc_max_long_edge": 1920`** (default) downscales 4K plates to HD for fast MP4s (portrait → ~1080×1920).
 
+### EXR I/O (LAOV-aligned)
+
+Writes use **`ImageOutput.write_image`** + zip compression (same as LAOV `oiio_io.write_exr`), not `ImageBuf.set_pixels` (that path produced **black/empty EXRs**).
+
+- **Matte:** straight RGB + **A** (readable in Nuke; premult from model is unpremulted on write)
+- **Normal:** unit **R,G,B** in [-1, 1] (like LAOV `n.x` / `n.y` / `n.z`)
+
+After `git pull`, re-run Cell 3 — empty old EXRs are **auto re-exported** (detected via read-back).
+
 ### Multi-person matte (`matte_subject_layout`)
 
 | Layout | Output | Nuke |
